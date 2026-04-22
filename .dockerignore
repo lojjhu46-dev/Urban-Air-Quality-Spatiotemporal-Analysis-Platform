@@ -1,0 +1,23 @@
+# Ignore local build artifacts and large datasets by default
+.venv
+__pycache__
+.pytest_cache
+*.pyc
+*.pyo
+*.pyd
+*.log
+.git
+.gitignore
+
+# Local data (use mounted volume in production when needed)
+data/raw
+
+# Optional: keep processed data out of image context; app can bootstrap demo data
+# If you want to bake data into image, comment this line.
+data/processed
+
+# IDE / OS files
+.idea
+.vscode
+.DS_Store
+Thumbs.db
