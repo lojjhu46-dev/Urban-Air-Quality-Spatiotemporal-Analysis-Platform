@@ -40,5 +40,12 @@ station_compare = (
     .mean()
     .reset_index()
 )
-fig = px.line(station_compare, x="timestamp", y=pollutant, color="station_id", title="Station daily comparison")
+fig = px.line(
+    station_compare,
+    x="timestamp",
+    y=pollutant,
+    color="station_id",
+    render_mode="svg",
+    title="Station daily comparison",
+)
 st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
