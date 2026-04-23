@@ -31,13 +31,12 @@ if len(available_ts) == 0:
 available_days = sorted(pd.Series(available_ts).dt.date.unique().tolist())
 selected_day = st.select_slider("Select day", options=available_days, value=available_days[-1])
 selected_hour = st.slider("Select hour", min_value=0, max_value=23, value=12, step=1)
-detailed_tiles = st.checkbox("Use detailed map tiles (slower)", value=False)
 
 selected_ts = pd.Timestamp(f"{selected_day} {selected_hour:02d}:00:00", tz=available_ts[0].tz)
 
 frame = build_map_frame(filtered, pollutant, selected_ts)
 st.plotly_chart(
-    map_figure(frame, pollutant, detailed_tiles=detailed_tiles),
+    map_figure(frame, pollutant),
     use_container_width=True,
     config={"displayModeBar": False},
 )
@@ -48,7 +47,7 @@ if st.button("Play hourly animation"):
     for offset in range(playback_hours):
         ts = selected_ts + pd.Timedelta(hours=offset)
         anim_frame = build_map_frame(filtered, pollutant, ts)
-        fig = map_figure(anim_frame, pollutant, detailed_tiles=detailed_tiles)
+        fig = map_figure(anim_frame, pollutant)
         fig.update_layout(title=f"{pollutant.upper()} @ {ts:%Y-%m-%d %H:%M}")
         placeholder.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
         time.sleep(0.16)

@@ -23,6 +23,7 @@ def trend_figure(df: pd.DataFrame, pollutant: str) -> go.Figure:
         x="timestamp",
         y=pollutant,
         color="station_id",
+        render_mode="svg",
         title=f"Daily trend: {pollutant.upper()}",
     )
     fig.update_layout(legend_title_text="Station", margin=dict(l=10, r=10, t=45, b=10))
@@ -44,39 +45,26 @@ def ranking_figure(df: pd.DataFrame, pollutant: str) -> go.Figure:
     return fig
 
 
-def map_figure(df: pd.DataFrame, pollutant: str, detailed_tiles: bool = False) -> go.Figure:
+def map_figure(df: pd.DataFrame, pollutant: str) -> go.Figure:
     if df.empty or pollutant not in df.columns:
         return go.Figure()
 
     working = df.copy()
     working["marker_size"] = np.clip(np.nan_to_num(working[pollutant].to_numpy(), nan=0.0), 5, None)
 
-    if detailed_tiles:
-        fig = px.scatter_mapbox(
-            working,
-            lat="lat",
-            lon="lon",
-            size="marker_size",
-            color=pollutant,
-            hover_name="station_id",
-            color_continuous_scale="Turbo",
-            zoom=8.8,
-            mapbox_style="carto-positron",
-            title=f"Station map: {pollutant.upper()}",
-        )
-    else:
-        fig = px.scatter(
-            working,
-            x="lon",
-            y="lat",
-            size="marker_size",
-            color=pollutant,
-            hover_name="station_id",
-            color_continuous_scale="Turbo",
-            title=f"Station distribution: {pollutant.upper()} (Lite mode)",
-            labels={"lon": "Longitude", "lat": "Latitude"},
-        )
-        fig.update_yaxes(scaleanchor="x", scaleratio=1)
+    fig = px.scatter(
+        working,
+        x="lon",
+        y="lat",
+        size="marker_size",
+        color=pollutant,
+        hover_name="station_id",
+        color_continuous_scale="Turbo",
+        render_mode="svg",
+        title=f"Station distribution: {pollutant.upper()}",
+        labels={"lon": "Longitude", "lat": "Latitude"},
+    )
+    fig.update_yaxes(scaleanchor="x", scaleratio=1)
 
     fig.update_layout(margin=dict(l=10, r=10, t=45, b=10))
     return fig
