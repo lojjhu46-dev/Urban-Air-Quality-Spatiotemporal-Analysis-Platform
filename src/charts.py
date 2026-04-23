@@ -111,8 +111,9 @@ def scatter_with_regression(df: pd.DataFrame, x_col: str, y_col: str, max_points
     if len(working) > max_points:
         working = working.sample(n=max_points, random_state=42)
 
+    # Use SVG scatter for maximum browser compatibility (no WebGL dependency).
     fig.add_trace(
-        go.Scattergl(
+        go.Scatter(
             x=working[x_col],
             y=working[y_col],
             mode="markers",
