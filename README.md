@@ -1,4 +1,4 @@
-﻿# Beijing Air Quality Spatiotemporal Analysis
+# City Air Quality Dashboard
 
 A medium-complexity data visualization project using Python 3.14, Streamlit, and Plotly.
 
@@ -8,22 +8,25 @@ A medium-complexity data visualization project using Python 3.14, Streamlit, and
 - Pollutant-weather correlation analysis
 - Optional OpenAQ realtime panel with fallback mode
 - ETL pipeline from raw CSV to cleaned Parquet
+- DeepSeek-assisted historical air-quality collection agent for user-selected cities
+- Sidebar dataset switcher so newly collected parquet files can be explored immediately
 
 ## Project Structure
 - `app.py`: Landing page
-- `pages/`: Streamlit multipage views
-- `src/`: Shared data, metrics, chart, and realtime modules
+- `pages/`: Streamlit multipage views, including the historical data agent
+- `src/`: Shared data, metrics, chart, realtime, and collection-agent modules
 - `scripts/build_dataset.py`: ETL from raw dataset to Parquet
 - `scripts/generate_demo_data.py`: Synthetic data generator for quick demo
-- `tests/`: Unit tests for data and metric logic
+- `tests/`: Unit tests for data, metric, and collection logic
 - `Dockerfile`: Container deployment config
 - `.streamlit/config.toml`: Streamlit runtime config
 - `.github/workflows/streamlit-cloud-check.yml`: GitHub Actions CI (lint/test)
 
 ## Data Sources
-- Primary historical data: UCI Beijing Multi-Site Air-Quality Data
-- Weather supplement: Open-Meteo historical API
+- Bundled historical example: UCI Beijing Multi-Site Air-Quality Data
+- Historical city agent: Open-Meteo Geocoding API + Open-Meteo Air Quality Archive + Open-Meteo Weather Archive
 - Optional realtime expansion: OpenAQ API
+- Optional planner/summarizer: DeepSeek Chat Completions API
 
 ## Quick Start
 1. Create and activate a Python 3.14 virtual environment.
@@ -34,8 +37,25 @@ A medium-complexity data visualization project using Python 3.14, Streamlit, and
 4. Or build from real raw CSV files:
    - Put `PRSA_Data_*.csv` into `data/raw/`
    - Run `python scripts/build_dataset.py --raw data/raw --out data/processed/beijing_aq.parquet`
-5. Launch app:
+5. Optional: configure DeepSeek in `.streamlit/secrets.toml` using `.streamlit/secrets.toml.example`
+6. Launch app:
    - `streamlit run app.py`
+
+## Historical Data Agent
+Open `Historical Data Agent` in the Streamlit sidebar and follow this flow:
+1. Enter a city query and optional ISO country code.
+2. Pick a resolved city candidate returned by Open-Meteo geocoding.
+3. Generate the collection plan.
+4. Run the collection agent.
+5. Switch to the newly saved parquet file from the sidebar dataset selector on any analysis page.
+
+The agent saves parquet outputs under `data/processed/agent_runs/` so they can be loaded by the existing dashboard pages.
+
+## Coverage Notes
+- The agent uses Open-Meteo historical air-quality data.
+- For European cities, CAMS Europe coverage starts on `2013-01-01` and is hourly.
+- For non-European cities, Open-Meteo global coverage starts on `2022-08-01` and is typically 3-hourly.
+- If a requested year range exceeds source availability, the agent clips the range and reports the exact adjusted dates in the plan.
 
 ## Docker Deployment
 1. Build image:
@@ -46,8 +66,8 @@ A medium-complexity data visualization project using Python 3.14, Streamlit, and
    - `http://localhost:8501`
 
 Notes:
-- If `data/processed/beijing_aq.parquet` is missing, app bootstraps demo data automatically.
-- For real datasets, mount a volume and point `data_path` via Streamlit secrets if needed.
+- If `data/processed/beijing_aq.parquet` is missing, the app bootstraps demo data automatically.
+- Agent-generated parquet files appear automatically in the app sidebar dataset selector.
 
 ## Streamlit Community Cloud Deployment
 1. Push this repo to GitHub.
@@ -56,6 +76,8 @@ Notes:
    - Python version: `3.14` (if available in Cloud UI; otherwise choose latest available and test)
 3. In App Settings -> Secrets (optional):
    - `data_path = "data/processed/beijing_aq.parquet"`
+   - `deepseek_api_key = "sk-..."`
+   - `deepseek_model = "deepseek-v4-flash"`
 4. Deploy.
 
 Included config:
@@ -69,10 +91,8 @@ Included config:
   - `Lint (Syntax)`: `py_compile`
   - `Test (Pytest)`: `pytest -q`
 
-This gives a lightweight gate before Streamlit Cloud rebuild/deploy.
-
 ## Accepted Data Contract
-Processed Parquet must include:
+Processed Parquet should include:
 - `timestamp`, `station_id`, `lat`, `lon`
 - `pm25`, `pm10`, `no2`, `so2`, `co`, `o3`
 - `temp`, `humidity`, `wind_speed`
@@ -85,4 +105,4 @@ Optional visualization-clipped columns:
 
 ## Notes
 - Realtime panel automatically degrades to historical mode when recent coverage is insufficient.
-- If OpenAQ endpoint changes, the realtime module fails safely without breaking historical pages.
+- If external API contracts change, the historical collection agent and realtime module fail safely with surfaced warnings.
