@@ -4,13 +4,18 @@ from datetime import date
 
 import pandas as pd
 
+import src.collection_agent as collection_agent
 from src.collection_agent import (
     CityCandidate,
     CollectionRequest,
+    ToolCallingAgentState,
     build_collection_plan,
     chunk_date_range,
+    execute_collection_agent_tool,
     finalize_collected_dataset,
+    get_collection_agent_tool_schemas,
     resolve_supported_window,
+    run_deepseek_tool_agent,
     summarize_dataset_coverage,
 )
 
@@ -118,3 +123,141 @@ def test_finalize_collected_dataset_matches_dashboard_contract() -> None:
     assert {"pm25_viz", "pm10_viz"}.issubset(out.columns)
     assert out["station_id"].nunique() == 1
     assert coverage[0]["non_null_ratio"] == 1.0
+
+
+def test_tool_schemas_toggle_run_collection() -> None:
+    names_without_run = [tool["function"]["name"] for tool in get_collection_agent_tool_schemas(include_run_collection=False)]
+    names_with_run = [tool["function"]["name"] for tool in get_collection_agent_tool_schemas(include_run_collection=True)]
+
+    assert names_without_run == ["search_city_candidates", "build_collection_plan"]
+    assert names_with_run == ["search_city_candidates", "build_collection_plan", "run_collection"]
+
+
+def test_execute_collection_agent_tool_build_plan_updates_state(monkeypatch) -> None:
+    state = ToolCallingAgentState()
+
+    def fake_search(query: str, country_code: str | None = None, count: int = 5, language: str = "en") -> list[CityCandidate]:
+        assert query == "Berlin"
+        assert country_code == "DE"
+        return [berlin_candidate()]
+
+    monkeypatch.setattr(collection_agent, "search_city_candidates", fake_search)
+
+    payload = execute_collection_agent_tool(
+        "build_collection_plan",
+        {
+            "city_query": "Berlin",
+            "country_code": "DE",
+            "start_year": 2013,
+            "end_year": 2014,
+            "pollutants": ["pm25", "o3"],
+            "include_weather": True,
+            "candidate_index": 0,
+        },
+        state=state,
+    )
+
+    assert payload["plan"]["city_label"] == "Berlin, Germany"
+    assert payload["plan"]["source_domain"] == "cams_europe"
+    assert state.selected_candidate is not None
+    assert state.selected_candidate.name == "Berlin"
+    assert state.last_plan is not None
+    assert state.last_plan.actual_start_date == "2013-01-01"
+
+
+def test_run_deepseek_tool_agent_completes_tool_loop(monkeypatch) -> None:
+    responses = [
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "build_collection_plan",
+                                    "arguments": "{\"city_query\": \"Berlin\", \"country_code\": \"DE\", \"start_year\": 2013, \"end_year\": 2014, \"pollutants\": [\"pm25\", \"o3\"], \"include_weather\": true, \"candidate_index\": 0}",
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "I selected Berlin and drafted a historical air-quality collection plan.",
+                    }
+                }
+            ]
+        },
+    ]
+
+    def fake_chat_completion(*args, **kwargs):
+        return responses.pop(0)
+
+    def fake_search(query: str, country_code: str | None = None, count: int = 5, language: str = "en") -> list[CityCandidate]:
+        assert query == "Berlin"
+        return [berlin_candidate()]
+
+    monkeypatch.setattr(collection_agent, "_deepseek_chat_completion", fake_chat_completion)
+    monkeypatch.setattr(collection_agent, "search_city_candidates", fake_search)
+
+    result = run_deepseek_tool_agent(
+        "Collect Berlin PM2.5 and O3 data from 2013 to 2014.",
+        api_key="sk-test",
+        allow_run_collection=False,
+    )
+
+    assert "Berlin" in result.assistant_message
+    assert result.state.last_plan is not None
+    assert result.tool_trace[0]["tool"] == "build_collection_plan"
+
+
+
+def test_deepseek_chat_completion_retries_with_compat_model(monkeypatch) -> None:
+    attempted_models: list[str] = []
+
+    class FakeResponse:
+        def __init__(self, status_code: int, body: dict[str, object] | str) -> None:
+            self.status_code = status_code
+            self._body = body
+            self.text = body if isinstance(body, str) else ""
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise collection_agent.requests.HTTPError(f"{self.status_code} Client Error")
+
+        def json(self) -> dict[str, object]:
+            if isinstance(self._body, dict):
+                return self._body
+            raise ValueError("non-json body")
+
+    def fake_post(url: str, headers: dict[str, str], json: dict[str, object], timeout: int):
+        del url, headers, timeout
+        attempted_models.append(str(json["model"]))
+        assert json.get("thinking") == {"type": "disabled"}
+        if json["model"] == "deepseek-v4-flash":
+            return FakeResponse(400, {"error": {"message": "tool calls not enabled for this model alias"}})
+        return FakeResponse(200, {"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(collection_agent.requests, "post", fake_post)
+
+    payload = collection_agent._deepseek_chat_completion(
+        [{"role": "user", "content": "test"}],
+        api_key="sk-test",
+        model="deepseek-v4-flash",
+        base_url="https://api.deepseek.com",
+        tools=[{"type": "function", "function": {"name": "noop", "parameters": {"type": "object", "properties": {}}}}],
+        tool_choice="auto",
+        thinking_type="disabled",
+    )
+
+    assert attempted_models == ["deepseek-v4-flash", "deepseek-chat"]
+    assert payload["choices"][0]["message"]["content"] == "ok"

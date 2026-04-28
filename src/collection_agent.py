@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import re
@@ -24,6 +24,8 @@ from src.config import (
     OPEN_METEO_WEATHER_ARCHIVE_URL,
     POLLUTANT_COLUMNS,
 )
+from src.data import output_dataset_path, write_dataset as write_tabular_dataset
+from src.i18n import t
 
 WEATHER_API_FIELDS = {
     "temp": "temperature_2m",
@@ -136,6 +138,23 @@ class CollectionResult:
         return pd.DataFrame(self.coverage_rows)
 
 
+@dataclass(slots=True)
+class ToolCallingAgentState:
+    last_candidates: list[CityCandidate] | None = None
+    last_search_query: str | None = None
+    last_country_code: str | None = None
+    selected_candidate: CityCandidate | None = None
+    last_plan: CollectionPlan | None = None
+    last_result: CollectionResult | None = None
+
+
+@dataclass(slots=True)
+class ToolCallingAgentResult:
+    assistant_message: str
+    tool_trace: list[dict[str, Any]]
+    state: ToolCallingAgentState
+
+
 def city_candidate_from_dict(data: dict[str, Any]) -> CityCandidate:
     return CityCandidate(**data)
 
@@ -200,6 +219,262 @@ def search_city_candidates(
     return candidates
 
 
+def get_collection_agent_tool_schemas(include_run_collection: bool = True) -> list[dict[str, Any]]:
+    pollutant_keys = sorted(AQ_AGENT_POLLUTANTS)
+
+    search_tool = {
+        "type": "function",
+        "function": {
+            "name": "search_city_candidates",
+            "description": "Search matching city candidates before planning or collecting data.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "City name or city phrase to resolve, such as Beijing or Los Angeles.",
+                    },
+                    "country_code": {
+                        "type": "string",
+                        "description": "Optional ISO-3166 alpha-2 country code such as CN, US, or DE.",
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "How many candidate matches to return.",
+                        "minimum": 1,
+                        "maximum": 10,
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    }
+
+    plan_tool = {
+        "type": "function",
+        "function": {
+            "name": "build_collection_plan",
+            "description": "Create a deterministic historical air-quality collection plan for a city candidate.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city_query": {"type": "string", "description": "City name to collect."},
+                    "country_code": {"type": "string", "description": "Optional ISO-3166 alpha-2 country code."},
+                    "start_year": {"type": "integer", "minimum": 2013},
+                    "end_year": {"type": "integer", "minimum": 2013},
+                    "pollutants": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": pollutant_keys},
+                        "minItems": 1,
+                    },
+                    "include_weather": {"type": "boolean", "description": "Whether to enrich with weather columns."},
+                    "candidate_index": {
+                        "type": "integer",
+                        "description": "Index from the last city search result to use as the resolved city candidate.",
+                        "minimum": 0,
+                    },
+                },
+                "required": ["city_query", "start_year", "end_year", "pollutants"],
+            },
+        },
+    }
+
+    tools = [search_tool, plan_tool]
+    if include_run_collection:
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": "run_collection",
+                    "description": "Execute the planned data collection and save a parquet dataset.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city_query": {"type": "string", "description": "City name to collect."},
+                            "country_code": {"type": "string", "description": "Optional ISO-3166 alpha-2 country code."},
+                            "start_year": {"type": "integer", "minimum": 2013},
+                            "end_year": {"type": "integer", "minimum": 2013},
+                            "pollutants": {
+                                "type": "array",
+                                "items": {"type": "string", "enum": pollutant_keys},
+                                "minItems": 1,
+                            },
+                            "include_weather": {"type": "boolean", "description": "Whether to enrich with weather columns."},
+                            "candidate_index": {
+                                "type": "integer",
+                                "description": "Index from the last city search result to use as the resolved city candidate.",
+                                "minimum": 0,
+                            },
+                        },
+                        "required": ["city_query", "start_year", "end_year", "pollutants"],
+                    },
+                },
+            }
+        )
+    return tools
+
+
+def execute_collection_agent_tool(
+    name: str,
+    raw_arguments: str | dict[str, Any],
+    *,
+    state: ToolCallingAgentState,
+    progress_callback: ProgressCallback | None = None,
+    output_dir: Path = AQ_AGENT_OUTPUT_DIR,
+    search_language: str = "en",
+    language: str = "en",
+) -> dict[str, Any]:
+    arguments = _coerce_tool_arguments(raw_arguments)
+
+    if name == "search_city_candidates":
+        query = str(arguments.get("query") or "").strip()
+        country_code = _normalize_country_code(arguments.get("country_code"))
+        count = int(arguments.get("count", 5))
+        candidates = search_city_candidates(query, country_code=country_code, count=count, language=search_language)
+        state.last_candidates = candidates
+        state.last_search_query = query
+        state.last_country_code = country_code
+        return {
+            "query": query,
+            "country_code": country_code,
+            "candidate_count": len(candidates),
+            "candidates": [_candidate_payload(candidate, index) for index, candidate in enumerate(candidates)],
+        }
+
+    if name == "build_collection_plan":
+        request = _collection_request_from_tool_arguments(arguments)
+        candidate_index = int(arguments.get("candidate_index", 0))
+        candidate, candidates = _resolve_candidate_for_tool(
+            request,
+            candidate_index=candidate_index,
+            state=state,
+            search_language=search_language,
+        )
+        plan = build_collection_plan(request, candidate, api_key=None, output_dir=output_dir, language=language)
+        state.last_plan = plan
+        return {
+            "selected_candidate": _candidate_payload(candidate, candidate_index),
+            "candidate_count": len(candidates),
+            "plan": plan.to_dict(),
+        }
+
+    if name == "run_collection":
+        request = _collection_request_from_tool_arguments(arguments)
+        candidate_index = int(arguments.get("candidate_index", 0))
+        candidate, candidates = _resolve_candidate_for_tool(
+            request,
+            candidate_index=candidate_index,
+            state=state,
+            search_language=search_language,
+        )
+        result = run_collection_agent(
+            request,
+            candidate,
+            api_key=None,
+            output_dir=output_dir,
+            progress_callback=progress_callback,
+            language=language,
+        )
+        state.last_plan = result.plan
+        state.last_result = result
+        return {
+            "selected_candidate": _candidate_payload(candidate, candidate_index),
+            "candidate_count": len(candidates),
+            "plan": result.plan.to_dict(),
+            "collection_result": _collection_result_payload(result),
+        }
+
+    raise ValueError(f"Unsupported agent tool: {name}")
+
+
+def run_deepseek_tool_agent(
+    user_prompt: str,
+    *,
+    api_key: str,
+    model: str = AQ_AGENT_DEFAULT_MODEL,
+    base_url: str = DEEPSEEK_BASE_URL,
+    default_request: CollectionRequest | None = None,
+    allow_run_collection: bool = False,
+    progress_callback: ProgressCallback | None = None,
+    output_dir: Path = AQ_AGENT_OUTPUT_DIR,
+    search_language: str = "en",
+    language: str = "en",
+    max_turns: int = 8,
+) -> ToolCallingAgentResult:
+    if not str(api_key).strip():
+        raise ValueError("DeepSeek API key is required for tool-calling agent mode.")
+
+    clean_prompt = user_prompt.strip()
+    if not clean_prompt:
+        raise ValueError("Agent instruction cannot be empty.")
+
+    state = ToolCallingAgentState()
+    tool_trace: list[dict[str, Any]] = []
+    messages: list[dict[str, Any]] = [{"role": "system", "content": _tool_calling_system_prompt(allow_run_collection, language=language)}]
+    if default_request is not None:
+        messages.append({"role": "system", "content": _default_request_context(default_request)})
+    messages.append({"role": "user", "content": clean_prompt})
+
+    tools = get_collection_agent_tool_schemas(include_run_collection=allow_run_collection)
+    last_assistant_content = ""
+
+    for _turn in range(max_turns):
+        response = _deepseek_chat_completion(
+            messages,
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+            tools=tools,
+            tool_choice="auto",
+            temperature=0.1,
+            timeout=90,
+            thinking_type="disabled",
+        )
+        choices = response.get("choices") or []
+        if not choices:
+            raise ValueError("DeepSeek returned no choices.")
+
+        raw_message = choices[0].get("message") or {}
+        assistant_message = _sanitize_assistant_message(raw_message)
+        messages.append(assistant_message)
+        last_assistant_content = str(assistant_message.get("content") or "").strip()
+
+        tool_calls = assistant_message.get("tool_calls") or []
+        if not tool_calls:
+            final_message = last_assistant_content or _fallback_agent_reply(state, allow_run_collection, language=language)
+            return ToolCallingAgentResult(assistant_message=final_message, tool_trace=tool_trace, state=state)
+
+        for tool_call in tool_calls:
+            function = tool_call.get("function") or {}
+            tool_name = str(function.get("name") or "").strip()
+            raw_arguments = function.get("arguments") or "{}"
+            tool_call_id = str(tool_call.get("id") or tool_name or f"call_{len(tool_trace) + 1}")
+            try:
+                tool_output = execute_collection_agent_tool(
+                    tool_name,
+                    raw_arguments,
+                    state=state,
+                    progress_callback=progress_callback,
+                    output_dir=output_dir,
+                    search_language=search_language,
+                    language=language,
+                )
+            except Exception as exc:  # noqa: BLE001
+                tool_output = {"error": str(exc), "tool": tool_name}
+
+            tool_trace.append({"tool": tool_name, "arguments": _coerce_tool_arguments(raw_arguments), "result": tool_output})
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps(tool_output, ensure_ascii=False),
+                }
+            )
+
+    final_message = last_assistant_content or _fallback_agent_reply(state, allow_run_collection, language=language)
+    return ToolCallingAgentResult(assistant_message=final_message, tool_trace=tool_trace, state=state)
+
+
 def build_collection_plan(
     request: CollectionRequest,
     candidate: CityCandidate,
@@ -207,6 +482,7 @@ def build_collection_plan(
     model: str = AQ_AGENT_DEFAULT_MODEL,
     base_url: str = DEEPSEEK_BASE_URL,
     output_dir: Path = AQ_AGENT_OUTPUT_DIR,
+    language: str = "en",
 ) -> CollectionPlan:
     pollutants = request.normalized_pollutants()
     start_year = int(request.start_year)
@@ -220,6 +496,7 @@ def build_collection_plan(
         candidate,
         requested_start,
         requested_end,
+        language=language,
     )
     if actual_start > actual_end:
         raise ValueError("The requested year range is outside the available archive window for this city.")
@@ -249,20 +526,20 @@ def build_collection_plan(
         warnings=warnings,
         planner_mode="deterministic",
         planner_model=None,
-        planner_notes=_default_planner_notes(candidate, pollutants, chunks, request.include_weather),
+        planner_notes=_default_planner_notes(candidate, pollutants, chunks, request.include_weather, language=language),
         quality_checks=[
-            "Confirm the first and last timestamps match the planned collection window.",
-            "Inspect non-null ratios for the selected pollutants after all chunks are merged.",
-            "Keep the dataset in parquet format so the existing dashboard pages can load it directly.",
+            t("collection.quality_window", language),
+            t("collection.quality_non_null", language),
+            t("collection.quality_parquet", language),
         ],
         risk_flags=[
-            "Historical coverage depends on the selected city and Open-Meteo domain availability.",
-            "Global CAMS data is 3-hourly rather than hourly, so time density can differ by region.",
+            t("collection.risk_coverage", language),
+            t("collection.risk_sampling", language),
         ],
     )
 
     if api_key:
-        planner_data = _generate_planner_guidance(plan, api_key=api_key, model=model, base_url=base_url)
+        planner_data = _generate_planner_guidance(plan, api_key=api_key, model=model, base_url=base_url, language=language)
         if planner_data:
             plan.planner_mode = "deepseek-assisted"
             plan.planner_model = model
@@ -286,6 +563,7 @@ def run_collection_agent(
     base_url: str = DEEPSEEK_BASE_URL,
     output_dir: Path = AQ_AGENT_OUTPUT_DIR,
     progress_callback: ProgressCallback | None = None,
+    language: str = "en",
 ) -> CollectionResult:
     plan = build_collection_plan(
         request,
@@ -294,6 +572,7 @@ def run_collection_agent(
         model=model,
         base_url=base_url,
         output_dir=output_dir,
+        language=language,
     )
 
     aq_frames: list[pd.DataFrame] = []
@@ -305,29 +584,35 @@ def run_collection_agent(
 
     for chunk in plan.chunks:
         step += 1
-        _notify(progress_callback, step, total_steps, f"Fetching air quality {chunk['start_date']} -> {chunk['end_date']}")
+        _notify(progress_callback, step, total_steps, t("collection.progress_air_quality", language, start=chunk["start_date"], end=chunk["end_date"]))
         aq_frame = fetch_air_quality_chunk(plan, chunk)
         if not aq_frame.empty:
             aq_frames.append(aq_frame)
 
         if plan.weather_variables:
             step += 1
-            _notify(progress_callback, step, total_steps, f"Fetching weather {chunk['start_date']} -> {chunk['end_date']}")
+            _notify(progress_callback, step, total_steps, t("collection.progress_weather", language, start=chunk["start_date"], end=chunk["end_date"]))
             try:
                 weather_frame = fetch_weather_chunk(plan, chunk)
             except Exception as exc:  # noqa: BLE001
                 runtime_warnings.append(
-                    f"Weather supplement skipped for {chunk['start_date']} to {chunk['end_date']}: {exc}"
+                    t(
+                        "collection.weather_skipped",
+                        language,
+                        start=chunk["start_date"],
+                        end=chunk["end_date"],
+                        error=exc,
+                    )
                 )
             else:
                 if not weather_frame.empty:
                     weather_frames.append(weather_frame)
 
     step += 1
-    _notify(progress_callback, step, total_steps, "Merging chunk outputs and building dashboard-ready dataset")
+    _notify(progress_callback, step, total_steps, t("collection.progress_merge", language))
     air_quality_df = _concat_unique_frames(aq_frames)
     if air_quality_df.empty:
-        raise ValueError("The collection run completed, but no air-quality rows were returned for the planned range.")
+        raise ValueError(t("collection.no_rows", language))
 
     weather_df = _concat_unique_frames(weather_frames)
     final_df = finalize_collected_dataset(
@@ -338,7 +623,8 @@ def run_collection_agent(
         longitude=candidate.longitude,
     )
 
-    save_dataset(final_df, Path(plan.output_path))
+    actual_output_path = save_dataset(final_df, Path(plan.output_path))
+    plan.output_path = str(actual_output_path)
 
     coverage_rows = summarize_dataset_coverage(final_df, plan.pollutants)
     summary_text, summary_mode = generate_collection_summary(
@@ -349,10 +635,11 @@ def run_collection_agent(
         api_key=api_key,
         model=model,
         base_url=base_url,
+        language=language,
     )
 
     step += 1
-    _notify(progress_callback, step, total_steps, f"Saved dataset to {plan.output_path}")
+    _notify(progress_callback, step, total_steps, t("collection.progress_saved", language, path=plan.output_path))
 
     return CollectionResult(
         plan=plan,
@@ -373,6 +660,7 @@ def resolve_supported_window(
     requested_start: date,
     requested_end: date,
     today: date | None = None,
+    language: str = "en",
 ) -> tuple[date, date, str, str, list[str]]:
     current_day = today or date.today()
     warnings: list[str] = []
@@ -390,11 +678,9 @@ def resolve_supported_window(
     actual_end = min(requested_end, current_day)
 
     if requested_start < supported_start:
-        warnings.append(
-            f"Requested start year was clipped to {supported_start.isoformat()} because this city's source window starts there."
-        )
+        warnings.append(t("collection.clipped_start", language, date=supported_start.isoformat()))
     if requested_end > current_day:
-        warnings.append(f"Requested end date was clipped to {current_day.isoformat()} because future history is unavailable.")
+        warnings.append(t("collection.clipped_end", language, date=current_day.isoformat()))
 
     return actual_start, actual_end, source_domain, sampling_step, warnings
 
@@ -430,7 +716,7 @@ def build_output_path(
         else:
             slug = f"city-{candidate.country_code.lower()}"
     filename = f"{slug}_{start_date.year}_{end_date.year}_aq.parquet"
-    return output_dir / filename
+    return output_dataset_path(output_dir / filename)
 
 
 def fetch_air_quality_chunk(plan: CollectionPlan, chunk: dict[str, str]) -> pd.DataFrame:
@@ -531,9 +817,8 @@ def finalize_collected_dataset(
     return out
 
 
-def save_dataset(df: pd.DataFrame, output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(output_path, index=False)
+def save_dataset(df: pd.DataFrame, output_path: Path) -> Path:
+    return write_tabular_dataset(df, output_path)
 
 
 def summarize_dataset_coverage(df: pd.DataFrame, pollutants: list[str]) -> list[dict[str, Any]]:
@@ -560,8 +845,9 @@ def generate_collection_summary(
     api_key: str | None = None,
     model: str = AQ_AGENT_DEFAULT_MODEL,
     base_url: str = DEEPSEEK_BASE_URL,
+    language: str = "en",
 ) -> tuple[str, str]:
-    deterministic_summary = _default_run_summary(df, plan, coverage_rows, runtime_warnings or [])
+    deterministic_summary = _default_run_summary(df, plan, coverage_rows, runtime_warnings or [], language=language)
     if not api_key:
         return deterministic_summary, "deterministic"
 
@@ -573,6 +859,7 @@ def generate_collection_summary(
         api_key=api_key,
         model=model,
         base_url=base_url,
+        language=language,
     )
     if not summary_data:
         return deterministic_summary, "deterministic"
@@ -580,7 +867,7 @@ def generate_collection_summary(
     llm_summary = str(summary_data.get("summary") or "").strip()
     caveat = str(summary_data.get("caveat") or "").strip()
     if caveat:
-        llm_summary = f"{llm_summary} Caveat: {caveat}".strip()
+        llm_summary = " ".join(part for part in [llm_summary, caveat] if part).strip()
     if not llm_summary:
         llm_summary = deterministic_summary
     return llm_summary, model
@@ -597,12 +884,17 @@ def _default_planner_notes(
     pollutants: list[str],
     chunks: list[dict[str, str]],
     include_weather: bool,
+    language: str = "en",
 ) -> str:
-    weather_note = "with weather enrichment" if include_weather else "without weather enrichment"
+    weather_note = t("collection.weather_with", language) if include_weather else t("collection.weather_without", language)
     pollutants_text = ", ".join(pollutant.upper() for pollutant in pollutants)
-    return (
-        f"Collect {pollutants_text} for {candidate.display_name} in {len(chunks)} chunk(s) {weather_note}, "
-        "then save a parquet dataset that can be loaded by the existing dashboard pages."
+    return t(
+        "collection.default_planner_notes",
+        language,
+        city=candidate.display_name,
+        chunks=len(chunks),
+        pollutants=pollutants_text,
+        weather_clause=weather_note,
     )
 
 
@@ -611,16 +903,148 @@ def _default_run_summary(
     plan: CollectionPlan,
     coverage_rows: list[dict[str, Any]],
     runtime_warnings: list[str],
+    language: str = "en",
 ) -> str:
     coverage_text = ", ".join(
         f"{row['pollutant'].upper()} {row['non_null_ratio']:.0%}" for row in coverage_rows
     )
-    warning_text = f" Warnings: {'; '.join(runtime_warnings)}" if runtime_warnings else ""
-    return (
-        f"Collected {len(df):,} rows for {plan.city_label} from {plan.actual_start_date} to {plan.actual_end_date}. "
-        f"Sampling is {plan.sampling_step}; selected pollutant coverage is {coverage_text}."
-        f" Saved to {plan.output_path}.{warning_text}"
+    warning_text = t("collection.summary_warnings", language, warnings='; '.join(runtime_warnings)) if runtime_warnings else ""
+    return t(
+        "collection.default_summary",
+        language,
+        city=plan.city_label,
+        rows=len(df),
+        start=plan.actual_start_date,
+        end=plan.actual_end_date,
+        sampling=plan.sampling_step,
+        coverage=coverage_text,
+        path=plan.output_path,
+        warnings=warning_text,
     )
+
+
+def _tool_calling_system_prompt(allow_run_collection: bool, language: str = "en") -> str:
+    run_rule = (
+        "You may execute the collection once the request is specific and a city candidate is resolved."
+        if allow_run_collection
+        else "Do not run data collection; stop after building the plan and explaining it."
+    )
+    reply_language = "Simplified Chinese" if language == "zh-CN" else "English"
+    pollutant_keys = ", ".join(sorted(AQ_AGENT_POLLUTANTS))
+    return (
+        "You are an air-quality data collection agent embedded in a Streamlit app. "
+        "Use tool calls to search cities, build a deterministic collection plan, and optionally run collection. "
+        f"Allowed pollutant keys are: {pollutant_keys}. "
+        "Search for city candidates first when the target city may be ambiguous. "
+        "When multiple candidates exist, prefer the most likely major-city match unless the user specifies otherwise. "
+        "Never claim historical coverage outside the dates returned by the planning tool. "
+        f"{run_rule} After finishing tool use, reply with a concise user-facing summary in {reply_language}."
+    )
+
+
+def _default_request_context(default_request: CollectionRequest) -> str:
+    return (
+        "Current UI defaults are available as optional hints, but the user's latest free-text instruction takes priority. "
+        f"Defaults: city_query={default_request.city_query!r}, country_code={default_request.country_code!r}, "
+        f"start_year={default_request.start_year}, end_year={default_request.end_year}, "
+        f"pollutants={default_request.normalized_pollutants()}, include_weather={default_request.include_weather}."
+    )
+
+
+def _collection_request_from_tool_arguments(arguments: dict[str, Any]) -> CollectionRequest:
+    city_query = str(arguments.get("city_query") or "").strip()
+    if not city_query:
+        raise ValueError("Tool arguments must include city_query.")
+
+    pollutants_raw = arguments.get("pollutants") or []
+    if not isinstance(pollutants_raw, list):
+        raise ValueError("Tool arguments field pollutants must be an array.")
+
+    return CollectionRequest(
+        city_query=city_query,
+        start_year=int(arguments.get("start_year")),
+        end_year=int(arguments.get("end_year")),
+        pollutants=[str(item) for item in pollutants_raw],
+        include_weather=bool(arguments.get("include_weather", True)),
+        country_code=_normalize_country_code(arguments.get("country_code")),
+    )
+
+
+def _resolve_candidate_for_tool(
+    request: CollectionRequest,
+    *,
+    candidate_index: int,
+    state: ToolCallingAgentState,
+    search_language: str,
+) -> tuple[CityCandidate, list[CityCandidate]]:
+    normalized_country = _normalize_country_code(request.country_code)
+    can_reuse_last_search = (
+        state.last_candidates is not None
+        and state.last_search_query == request.city_query.strip()
+        and state.last_country_code == normalized_country
+    )
+
+    if can_reuse_last_search:
+        candidates = state.last_candidates or []
+    else:
+        candidates = search_city_candidates(
+            request.city_query,
+            country_code=normalized_country,
+            count=max(candidate_index + 1, 5),
+            language=search_language,
+        )
+        state.last_candidates = candidates
+        state.last_search_query = request.city_query.strip()
+        state.last_country_code = normalized_country
+
+    if not candidates:
+        raise ValueError(f"No matching city candidates were found for {request.city_query!r}.")
+    if candidate_index < 0 or candidate_index >= len(candidates):
+        raise ValueError(f"candidate_index {candidate_index} is outside the available range 0..{len(candidates) - 1}.")
+
+    candidate = candidates[candidate_index]
+    state.selected_candidate = candidate
+    return candidate, candidates
+
+
+def _candidate_payload(candidate: CityCandidate, index: int | None = None) -> dict[str, Any]:
+    payload = candidate.to_dict()
+    payload["display_name"] = candidate.display_name
+    if index is not None:
+        payload["index"] = index
+    return payload
+
+
+def _collection_result_payload(result: CollectionResult) -> dict[str, Any]:
+    return {
+        "output_path": result.output_path,
+        "row_count": result.row_count,
+        "started_at": result.started_at,
+        "ended_at": result.ended_at,
+        "coverage_rows": result.coverage_rows,
+        "runtime_warnings": result.runtime_warnings,
+        "summary_text": result.summary_text,
+        "summary_mode": result.summary_mode,
+    }
+
+
+def _fallback_agent_reply(state: ToolCallingAgentState, allow_run_collection: bool, language: str = "en") -> str:
+    if state.last_result is not None:
+        return state.last_result.summary_text
+    if state.last_plan is not None:
+        key = "collection.agent_planned" if not allow_run_collection else "collection.agent_prepared"
+        return t(key, language, city=state.last_plan.city_label)
+    return t("collection.agent_no_message", language)
+
+
+def _sanitize_assistant_message(message: dict[str, Any]) -> dict[str, Any]:
+    sanitized: dict[str, Any] = {
+        "role": "assistant",
+        "content": message.get("content"),
+    }
+    if message.get("tool_calls"):
+        sanitized["tool_calls"] = message["tool_calls"]
+    return sanitized
 
 
 def _generate_planner_guidance(
@@ -628,13 +1052,16 @@ def _generate_planner_guidance(
     api_key: str,
     model: str,
     base_url: str,
+    language: str = "en",
 ) -> dict[str, Any] | None:
+    reply_language = "Simplified Chinese" if language == "zh-CN" else "English"
     messages = [
         {
             "role": "system",
             "content": (
                 "You are a data collection planner for an air-quality dashboard. "
-                "Return JSON only and never claim data exists outside the provided source window."
+                "Return JSON only and never claim data exists outside the provided source window. "
+                f"Write planner_notes, quality_checks, and risk_flags in {reply_language}."
             ),
         },
         {
@@ -657,7 +1084,9 @@ def _generate_run_summary(
     api_key: str,
     model: str,
     base_url: str,
+    language: str = "en",
 ) -> dict[str, Any] | None:
+    reply_language = "Simplified Chinese" if language == "zh-CN" else "English"
     preview = {
         "city": plan.city_label,
         "range": [plan.actual_start_date, plan.actual_end_date],
@@ -671,7 +1100,8 @@ def _generate_run_summary(
             "role": "system",
             "content": (
                 "You summarize completed air-quality data collection runs. "
-                "Return JSON only with keys summary and caveat."
+                "Return JSON only with keys summary and caveat. "
+                f"Write both fields in {reply_language}."
             ),
         },
         {
@@ -689,23 +1119,15 @@ def _deepseek_json_completion(
     base_url: str,
     timeout: int = 90,
 ) -> dict[str, Any] | None:
-    endpoint = f"{base_url.rstrip('/')}/chat/completions"
-    response = requests.post(
-        endpoint,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "messages": messages,
-            "stream": False,
-            "temperature": 0.1,
-        },
+    payload = _deepseek_chat_completion(
+        messages,
+        api_key=api_key,
+        model=model,
+        base_url=base_url,
+        temperature=0.1,
         timeout=timeout,
+        thinking_type="disabled",
     )
-    response.raise_for_status()
-    payload = response.json()
     choices = payload.get("choices") or []
     if not choices:
         return None
@@ -717,6 +1139,99 @@ def _deepseek_json_completion(
         return _extract_json_object(str(content))
     except Exception:  # noqa: BLE001
         return None
+
+
+def _deepseek_model_candidates(model: str) -> list[str]:
+    candidates = [model]
+    if model == "deepseek-v4-flash":
+        candidates.append("deepseek-chat")
+    return candidates
+
+
+def _deepseek_http_error(response: requests.Response, exc: requests.HTTPError, model: str) -> requests.HTTPError:
+    detail = ""
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001
+        body = response.text.strip()
+    if isinstance(body, dict):
+        raw_error = body.get("error") or body.get("message") or body.get("reason") or body
+        detail = raw_error if isinstance(raw_error, str) else json.dumps(raw_error, ensure_ascii=False)
+    else:
+        detail = str(body).strip()
+
+    message = f"{exc}. Model: {model}"
+    if detail:
+        message = f"{message}. Response: {detail}"
+    return requests.HTTPError(message, response=response)
+
+
+def _deepseek_chat_completion(
+    messages: list[dict[str, Any]],
+    *,
+    api_key: str,
+    model: str,
+    base_url: str,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+    temperature: float = 0.1,
+    timeout: int = 90,
+    thinking_type: str | None = None,
+) -> dict[str, Any]:
+    endpoint = f"{base_url.rstrip('/')}/chat/completions"
+    candidates = _deepseek_model_candidates(model)
+    last_error: requests.HTTPError | None = None
+
+    for idx, candidate_model in enumerate(candidates):
+        payload: dict[str, Any] = {
+            "model": candidate_model,
+            "messages": messages,
+            "stream": False,
+            "temperature": temperature,
+        }
+        if tools is not None:
+            payload["tools"] = tools
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+        if thinking_type is not None:
+            payload["thinking"] = {"type": thinking_type}
+
+        response = requests.post(
+            endpoint,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=timeout,
+        )
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            wrapped = _deepseek_http_error(response, exc, candidate_model)
+            last_error = wrapped
+            is_last_candidate = idx == len(candidates) - 1
+            if response.status_code == 400 and not is_last_candidate:
+                continue
+            raise wrapped from exc
+        return response.json()
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("DeepSeek request failed before a response was returned.")
+
+
+def _coerce_tool_arguments(raw_arguments: str | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(raw_arguments, dict):
+        return raw_arguments
+
+    text = str(raw_arguments or "").strip()
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return _extract_json_object(text)
 
 
 def _extract_json_object(content: str) -> dict[str, Any]:
@@ -777,3 +1292,10 @@ def _unique_strings(values: list[str]) -> list[str]:
         output.append(text)
         seen.add(text)
     return output
+
+
+def _normalize_country_code(value: Any) -> str | None:
+    text = str(value or "").strip().upper()
+    return text or None
+
+

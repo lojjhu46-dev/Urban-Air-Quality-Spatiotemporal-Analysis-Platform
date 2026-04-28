@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import timedelta
 from pathlib import Path
@@ -7,10 +7,17 @@ import pandas as pd
 import streamlit as st
 
 from src.config import AQ_AGENT_OUTPUT_DIR, DEFAULT_DATA_PATH, POLLUTANT_COLUMNS
-from src.data import filter_dataset, load_dataset
+from src.data import (
+    filter_dataset,
+    load_dataset,
+    pyarrow_runtime_available,
+    resolve_existing_dataset_path,
+)
+from src.i18n import t
 
 DATASET_OVERRIDE_KEY = "data_path_override"
 DATASET_CHOICE_KEY = "dataset_path_choice"
+PENDING_DATASET_CHOICE_KEY = "pending_dataset_path_choice"
 
 
 def _configured_default_dataset_path() -> Path:
@@ -28,16 +35,19 @@ def _configured_default_dataset_path() -> Path:
 def discover_dataset_paths(root: Path | None = None) -> list[Path]:
     search_root = root or DEFAULT_DATA_PATH.parent
     candidates: list[Path] = []
-    for path in sorted(search_root.rglob("*.parquet")):
-        candidates.append(path)
+    for pattern in ("*.parquet", "*.csv"):
+        for path in sorted(search_root.rglob(pattern)):
+            candidates.append(path)
 
     if AQ_AGENT_OUTPUT_DIR.exists():
-        for path in sorted(AQ_AGENT_OUTPUT_DIR.rglob("*.parquet")):
-            candidates.append(path)
+        for pattern in ("*.parquet", "*.csv"):
+            for path in sorted(AQ_AGENT_OUTPUT_DIR.rglob(pattern)):
+                candidates.append(path)
 
     seen: set[str] = set()
     unique_paths: list[Path] = []
-    for path in [DEFAULT_DATA_PATH, *candidates]:
+    default_path = resolve_existing_dataset_path(_configured_default_dataset_path())
+    for path in [default_path, *candidates]:
         raw = str(path)
         if raw in seen:
             continue
@@ -52,12 +62,19 @@ def format_dataset_label(path: Path) -> str:
         suffix = relative.as_posix()
     except ValueError:
         suffix = str(path)
-    return f"{path.stem} ({suffix})"
+    return f"{path.stem} [{path.suffix.lstrip('.').upper()}] ({suffix})"
 
 
 def dataset_path_from_env(show_selector: bool = True) -> Path:
-    configured_default = _configured_default_dataset_path()
-    selected_default = Path(st.session_state.get(DATASET_OVERRIDE_KEY, configured_default))
+    configured_default = resolve_existing_dataset_path(_configured_default_dataset_path())
+
+    pending_choice = st.session_state.pop(PENDING_DATASET_CHOICE_KEY, None)
+    if pending_choice is not None:
+        resolved_pending = resolve_existing_dataset_path(pending_choice)
+        st.session_state[DATASET_OVERRIDE_KEY] = str(resolved_pending)
+        st.session_state[DATASET_CHOICE_KEY] = str(resolved_pending)
+
+    selected_default = resolve_existing_dataset_path(Path(st.session_state.get(DATASET_OVERRIDE_KEY, configured_default)))
     dataset_paths = discover_dataset_paths()
 
     if str(selected_default) not in {str(path) for path in dataset_paths}:
@@ -68,20 +85,21 @@ def dataset_path_from_env(show_selector: bool = True) -> Path:
         return selected_default
 
     options = [str(path) for path in dataset_paths]
-    current_value = str(st.session_state.get(DATASET_CHOICE_KEY, selected_default))
+    current_value = str(resolve_existing_dataset_path(st.session_state.get(DATASET_CHOICE_KEY, selected_default)))
     if current_value not in options:
         current_value = str(selected_default)
 
     selected = st.sidebar.selectbox(
-        "Dataset",
+        t("ui.dataset"),
         options=options,
         index=options.index(current_value),
         format_func=lambda raw: format_dataset_label(Path(raw)),
         key=DATASET_CHOICE_KEY,
     )
-    st.session_state[DATASET_OVERRIDE_KEY] = selected
-    st.sidebar.caption("Tip: agent-generated parquet files appear here automatically.")
-    return Path(selected)
+    resolved_selected = resolve_existing_dataset_path(selected)
+    st.session_state[DATASET_OVERRIDE_KEY] = str(resolved_selected)
+    st.sidebar.caption(t("ui.dataset_hint"))
+    return resolved_selected
 
 
 @st.cache_data(show_spinner=False)
@@ -89,12 +107,29 @@ def cached_load_dataset(path: str) -> pd.DataFrame:
     return load_dataset(path)
 
 
+def render_dataframe(
+    df: pd.DataFrame,
+    *,
+    hide_index: bool = False,
+    use_container_width: bool = True,
+) -> None:
+    if pyarrow_runtime_available():
+        st.dataframe(df, hide_index=hide_index, use_container_width=use_container_width)
+        return
+
+    html = df.to_html(index=not hide_index, escape=True)
+    wrapper = html
+    if use_container_width:
+        wrapper = f'<div style="width:100%; overflow-x:auto;">{html}</div>'
+    st.markdown(wrapper, unsafe_allow_html=True)
+
+
 def render_filters(
     df: pd.DataFrame,
     default_pollutant: str = "pm25",
     default_days: int = 180,
 ) -> tuple[pd.DataFrame, str, list[str]]:
-    st.sidebar.header("Global filters")
+    st.sidebar.header(t("ui.filters"))
 
     min_date = df["timestamp"].min().date()
     max_date = df["timestamp"].max().date()
@@ -102,7 +137,7 @@ def render_filters(
     default_start = max(min_date, max_date - timedelta(days=max(default_days - 1, 0)))
 
     selected_dates = st.sidebar.date_input(
-        "Date range",
+        t("ui.date_range"),
         (default_start, max_date),
         min_value=min_date,
         max_value=max_date,
@@ -111,11 +146,11 @@ def render_filters(
         selected_dates = (default_start, max_date)
 
     stations = sorted(df["station_id"].dropna().unique().tolist())
-    selected_stations = st.sidebar.multiselect("Stations", stations, default=stations)
+    selected_stations = st.sidebar.multiselect(t("ui.stations"), stations, default=stations)
 
     pollutants = [col for col in POLLUTANT_COLUMNS if col in df.columns]
     default_idx = pollutants.index(default_pollutant) if default_pollutant in pollutants else 0
-    selected_pollutant = st.sidebar.selectbox("Primary pollutant", pollutants, index=default_idx)
+    selected_pollutant = st.sidebar.selectbox(t("ui.primary_pollutant"), pollutants, index=default_idx)
 
     filtered = filter_dataset(
         df,
@@ -124,6 +159,6 @@ def render_filters(
         pollutants=pollutants,
     )
 
-    st.sidebar.caption("Performance tip: keep date range focused (e.g., 30-180 days) for smoother interaction.")
+    st.sidebar.caption(t("ui.performance_hint"))
 
     return filtered, selected_pollutant, pollutants

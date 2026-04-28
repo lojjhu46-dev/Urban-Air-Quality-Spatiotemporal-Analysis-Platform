@@ -12,13 +12,14 @@ import numpy as np
 import pandas as pd
 import requests
 
+from src.data import write_dataset
 from src.config import BEIJING_CENTER, POLLUTANT_COLUMNS, STATION_COORDS, TIMEZONE
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build processed Beijing AQ dataset from raw CSV files.")
     parser.add_argument("--raw", type=Path, required=True, help="Directory containing PRSA_Data_*.csv")
-    parser.add_argument("--out", type=Path, required=True, help="Output parquet path")
+    parser.add_argument("--out", type=Path, required=True, help="Output dataset path (.parquet or .csv)")
     parser.add_argument("--skip-weather-api", action="store_true", help="Skip Open-Meteo weather supplement")
     return parser.parse_args()
 
@@ -215,9 +216,9 @@ def main() -> None:
     final = finalize_columns(merged)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    final.to_parquet(args.out, index=False)
+    actual_out = write_dataset(final, args.out)
 
-    print(f"[OK] Wrote {len(final):,} rows to {args.out}")
+    print(f"[OK] Wrote {len(final):,} rows to {actual_out}")
     print(f"[OK] Time range: {final['timestamp'].min()} -> {final['timestamp'].max()}")
     print(f"[OK] Stations: {final['station_id'].nunique()}")
 

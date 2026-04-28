@@ -16,8 +16,6 @@ POLLUTANT_THRESHOLDS = {
     "o3": 200.0,
 }
 
-REALTIME_MIN_COVERAGE = 0.60
-
 DEFAULT_DATA_PATH = Path("data/processed/beijing_aq.parquet")
 AQ_AGENT_OUTPUT_DIR = Path("data/processed/agent_runs")
 

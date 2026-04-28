@@ -11,12 +11,13 @@ if str(PROJECT_ROOT) not in sys.path:
 import numpy as np
 import pandas as pd
 
+from src.data import write_dataset
 from src.config import POLLUTANT_COLUMNS, STATION_COORDS, TIMEZONE
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate synthetic Beijing AQ dataset for demo usage.")
-    parser.add_argument("--out", type=Path, required=True, help="Output parquet path")
+    parser.add_argument("--out", type=Path, required=True, help="Output dataset path (.parquet or .csv)")
     parser.add_argument("--days", type=int, default=60, help="Number of historical days")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     return parser.parse_args()
@@ -70,9 +71,9 @@ def main() -> None:
         df[f"{col}_viz"] = df[col].clip(lower, upper)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(args.out, index=False)
+    actual_out = write_dataset(df, args.out)
 
-    print(f"[OK] Wrote demo data to {args.out}")
+    print(f"[OK] Wrote demo data to {actual_out}")
     print(f"[OK] Rows: {len(df):,}, Stations: {df['station_id'].nunique()}")
 
 

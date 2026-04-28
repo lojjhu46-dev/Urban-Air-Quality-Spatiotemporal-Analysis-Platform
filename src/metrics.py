@@ -2,10 +2,10 @@
 
 from typing import Iterable
 
-import numpy as np
 import pandas as pd
 
 from src.config import POLLUTANT_COLUMNS, POLLUTANT_THRESHOLDS, WEATHER_COLUMNS
+from src.i18n import t
 
 
 def compute_metrics(
@@ -80,7 +80,7 @@ def compute_correlations(
     return df[cols].corr(method="pearson")
 
 
-def detect_events(df: pd.DataFrame, pollutant: str = "pm25") -> pd.DataFrame:
+def detect_events(df: pd.DataFrame, pollutant: str = "pm25", language: str | None = None) -> pd.DataFrame:
     """Create coarse event labels from daily city averages."""
     if df.empty or pollutant not in df.columns:
         return pd.DataFrame(columns=["timestamp", "event", "description"])
@@ -111,7 +111,7 @@ def detect_events(df: pd.DataFrame, pollutant: str = "pm25") -> pd.DataFrame:
                 {
                     "timestamp": ts,
                     "event": "heavy_pollution",
-                    "description": f"{pollutant.upper()} high day ({val:.1f})",
+                    "description": t("events.heavy_pollution", language, pollutant=pollutant.upper(), value=val),
                 }
             )
         if idx > 0 and delta.iloc[idx] >= delta_threshold:
@@ -119,7 +119,7 @@ def detect_events(df: pd.DataFrame, pollutant: str = "pm25") -> pd.DataFrame:
                 {
                     "timestamp": ts,
                     "event": "sharp_shift",
-                    "description": f"Rapid day-over-day shift ({delta.iloc[idx]:.1f})",
+                    "description": t("events.sharp_shift", language, delta=delta.iloc[idx]),
                 }
             )
 
