@@ -1,0 +1,269 @@
+from __future__ import annotations
+
+import unicodedata
+from dataclasses import dataclass
+
+from src.config import EUROPE_COUNTRY_CODES
+
+
+@dataclass(frozen=True, slots=True)
+class AgentCityOption:
+    continent: str
+    country: str
+    province: str | None
+    city: str
+    country_code: str
+    sort_key: str
+    query: str | None = None
+
+    @property
+    def city_query(self) -> str:
+        return self.query or self.city
+
+    @property
+    def path_label(self) -> str:
+        parts = [self.continent, self.country]
+        if self.province:
+            parts.append(self.province)
+        parts.append(self.city)
+        return " - ".join(parts)
+
+    @property
+    def supported_start_year(self) -> int:
+        return 2013 if self.country_code.upper() in EUROPE_COUNTRY_CODES else 2022
+
+    @property
+    def source_summary(self) -> tuple[str, str]:
+        if self.country_code.upper() in EUROPE_COUNTRY_CODES:
+            return "CAMS Europe", "hourly since 2013-01-01"
+        return "Open-Meteo Global", "3-hourly since 2022-08-01"
+
+
+_CATALOG = (
+    AgentCityOption("Africa", "Kenya", "Nairobi County", "Nairobi", "KE", "nairobi"),
+    AgentCityOption("Africa", "South Africa", "Gauteng", "Johannesburg", "ZA", "johannesburg"),
+    AgentCityOption("Africa", "South Africa", "Western Cape", "Cape Town", "ZA", "cape-town"),
+    AgentCityOption("Asia", "China", "Beijing Municipality", "Beijing", "CN", "beijing"),
+    AgentCityOption("Asia", "China", "Sichuan", "Chengdu", "CN", "chengdu"),
+    AgentCityOption("Asia", "China", "Guangdong", "Guangzhou", "CN", "guangzhou"),
+    AgentCityOption("Asia", "China", "Zhejiang", "Hangzhou", "CN", "hangzhou"),
+    AgentCityOption("Asia", "China", "Shaanxi", "Xi'an", "CN", "xian", query="Xian"),
+    AgentCityOption("Asia", "China", "Shanghai Municipality", "Shanghai", "CN", "shanghai"),
+    AgentCityOption("Asia", "China", "Guangdong", "Shenzhen", "CN", "shenzhen"),
+    AgentCityOption("Asia", "China", "Hubei", "Wuhan", "CN", "wuhan"),
+    AgentCityOption("Asia", "India", "Karnataka", "Bengaluru", "IN", "bengaluru"),
+    AgentCityOption("Asia", "India", "Delhi", "Delhi", "IN", "delhi"),
+    AgentCityOption("Asia", "India", "Maharashtra", "Mumbai", "IN", "mumbai"),
+    AgentCityOption("Asia", "Japan", "Fukuoka", "Fukuoka", "JP", "fukuoka"),
+    AgentCityOption("Asia", "Japan", "Hokkaido", "Sapporo", "JP", "sapporo"),
+    AgentCityOption("Asia", "Japan", "Kyoto", "Kyoto", "JP", "kyoto"),
+    AgentCityOption("Asia", "Japan", "Osaka", "Osaka", "JP", "osaka"),
+    AgentCityOption("Asia", "Japan", "Tokyo", "Tokyo", "JP", "tokyo"),
+    AgentCityOption("Asia", "Singapore", None, "Singapore", "SG", "singapore"),
+    AgentCityOption("Asia", "South Korea", "Busan", "Busan", "KR", "busan"),
+    AgentCityOption("Asia", "South Korea", "Incheon", "Incheon", "KR", "incheon"),
+    AgentCityOption("Asia", "South Korea", "Seoul", "Seoul", "KR", "seoul"),
+    AgentCityOption("Asia", "United Arab Emirates", "Abu Dhabi", "Abu Dhabi", "AE", "abu-dhabi"),
+    AgentCityOption("Asia", "United Arab Emirates", "Dubai", "Dubai", "AE", "dubai"),
+    AgentCityOption("Europe", "France", "Auvergne-Rhone-Alpes", "Lyon", "FR", "lyon"),
+    AgentCityOption("Europe", "France", "Ile-de-France", "Paris", "FR", "paris"),
+    AgentCityOption("Europe", "France", "Provence-Alpes-Cote d'Azur", "Marseille", "FR", "marseille"),
+    AgentCityOption("Europe", "Germany", "Berlin", "Berlin", "DE", "berlin"),
+    AgentCityOption("Europe", "Germany", "Hesse", "Frankfurt", "DE", "frankfurt"),
+    AgentCityOption("Europe", "Germany", "Hamburg", "Hamburg", "DE", "hamburg"),
+    AgentCityOption("Europe", "Germany", "Bavaria", "Munich", "DE", "munich"),
+    AgentCityOption("Europe", "Italy", "Lazio", "Rome", "IT", "rome"),
+    AgentCityOption("Europe", "Italy", "Lombardy", "Milan", "IT", "milan"),
+    AgentCityOption("Europe", "Netherlands", "North Holland", "Amsterdam", "NL", "amsterdam"),
+    AgentCityOption("Europe", "Netherlands", "South Holland", "Rotterdam", "NL", "rotterdam"),
+    AgentCityOption("Europe", "Poland", "Lesser Poland", "Krakow", "PL", "krakow"),
+    AgentCityOption("Europe", "Poland", "Masovian", "Warsaw", "PL", "warsaw"),
+    AgentCityOption("Europe", "Spain", "Catalonia", "Barcelona", "ES", "barcelona"),
+    AgentCityOption("Europe", "Spain", "Community of Madrid", "Madrid", "ES", "madrid"),
+    AgentCityOption("Europe", "Spain", "Valencian Community", "Valencia", "ES", "valencia"),
+    AgentCityOption("Europe", "United Kingdom", "England", "London", "GB", "london"),
+    AgentCityOption("Europe", "United Kingdom", "Scotland", "Edinburgh", "GB", "edinburgh"),
+    AgentCityOption("Europe", "United Kingdom", "England", "Manchester", "GB", "manchester"),
+    AgentCityOption("North America", "Canada", "Quebec", "Montreal", "CA", "montreal"),
+    AgentCityOption("North America", "Canada", "Ontario", "Toronto", "CA", "toronto"),
+    AgentCityOption("North America", "Canada", "British Columbia", "Vancouver", "CA", "vancouver"),
+    AgentCityOption("North America", "Mexico", "Mexico City", "Mexico City", "MX", "mexico-city"),
+    AgentCityOption("North America", "United States", "Illinois", "Chicago", "US", "chicago"),
+    AgentCityOption("North America", "United States", "California", "Los Angeles", "US", "los-angeles"),
+    AgentCityOption("North America", "United States", "New York", "New York", "US", "new-york"),
+    AgentCityOption("North America", "United States", "California", "San Francisco", "US", "san-francisco"),
+    AgentCityOption("North America", "United States", "Washington", "Seattle", "US", "seattle"),
+    AgentCityOption("Oceania", "Australia", "Queensland", "Brisbane", "AU", "brisbane"),
+    AgentCityOption("Oceania", "Australia", "Victoria", "Melbourne", "AU", "melbourne"),
+    AgentCityOption("Oceania", "Australia", "Western Australia", "Perth", "AU", "perth"),
+    AgentCityOption("Oceania", "Australia", "New South Wales", "Sydney", "AU", "sydney"),
+    AgentCityOption("Oceania", "New Zealand", "Auckland", "Auckland", "NZ", "auckland"),
+    AgentCityOption("Oceania", "New Zealand", "Wellington", "Wellington", "NZ", "wellington"),
+    AgentCityOption("South America", "Argentina", "Buenos Aires", "Buenos Aires", "AR", "buenos-aires"),
+    AgentCityOption("South America", "Brazil", "Rio de Janeiro", "Rio de Janeiro", "BR", "rio-de-janeiro"),
+    AgentCityOption("South America", "Brazil", "Sao Paulo", "Sao Paulo", "BR", "sao-paulo"),
+    AgentCityOption("South America", "Chile", "Santiago Metropolitan", "Santiago", "CL", "santiago"),
+)
+
+DEFAULT_CITY_PATH = ("Asia", "China", "Beijing Municipality", "Beijing")
+
+
+def continent_labels() -> list[str]:
+    return _unique_preserving_order(option.continent for option in _CATALOG)
+
+
+def country_labels(continent: str) -> list[str]:
+    return sorted(
+        {option.country for option in _CATALOG if option.continent == continent},
+        key=_normalize_sort_key,
+    )
+
+
+def province_labels(continent: str, country: str) -> list[str]:
+    return sorted(
+        {option.province for option in _CATALOG if option.continent == continent and option.country == country and option.province},
+        key=_normalize_sort_key,
+    )
+
+
+def city_labels(continent: str, country: str, province: str | None = None) -> list[str]:
+    return [option.city for option in city_options(continent, country, province)]
+
+
+def city_options(continent: str, country: str, province: str | None = None) -> list[AgentCityOption]:
+    filtered = [
+        option
+        for option in _CATALOG
+        if option.continent == continent
+        and option.country == country
+        and ((province or None) == option.province if province else True)
+    ]
+    return sorted(filtered, key=lambda option: option.sort_key)
+
+
+def city_option_from_path(continent: str, country: str, province: str | None, city: str) -> AgentCityOption:
+    for option in _CATALOG:
+        if option.continent == continent and option.country == country and option.province == (province or None) and option.city == city:
+            return option
+    raise ValueError(f"Unknown city selection: {continent=} {country=} {province=} {city=}")
+
+
+def build_agent_instruction(
+    city_option: AgentCityOption,
+    start_year: int,
+    end_year: int,
+    pollutants: list[str],
+    weather_fields: list[str],
+    *,
+    language: str = "en",
+) -> str:
+    pollutant_text = ", ".join(_unique_lower(pollutants)) or "pm25"
+    weather_text = ", ".join(_unique_lower(weather_fields))
+
+    if language == "zh-CN":
+        weather_clause = f"附加气象字段 {weather_text}" if weather_text else "不附加气象字段"
+        return (
+            f"目标城市限定为 {city_option.path_label}。"
+            f"请采集 {start_year} 年到 {end_year} 年的 {pollutant_text} 历史空气质量数据，"
+            f"{weather_clause}，并保存为当前 dashboard 可直接加载的数据集。"
+        )
+
+    weather_clause = f"include weather fields {weather_text}" if weather_text else "skip weather fields"
+    return (
+        f"Limit the target city to {city_option.path_label}. "
+        f"Collect historical air-quality data for {pollutant_text} from {start_year} to {end_year}, "
+        f"{weather_clause}, and save a dataset that the current dashboard can load directly."
+    )
+
+
+def build_city_search_queries(city_option: AgentCityOption) -> list[str]:
+    province = city_option.province or ""
+    return _unique_strings(
+        [
+            city_option.city_query,
+            f"{city_option.city} {province}".strip(),
+            f"{city_option.city} {city_option.country}".strip(),
+            f"{city_option.city_query} {city_option.country_code}".strip(),
+        ]
+    )
+
+
+def candidate_matches_city_option(
+    city_option: AgentCityOption,
+    *,
+    candidate_name: str,
+    candidate_admin1: str | None,
+    candidate_country_code: str | None,
+) -> bool:
+    if city_option.country_code and str(candidate_country_code or "").upper() != city_option.country_code.upper():
+        return False
+
+    city_name = _normalize_location_name(city_option.city)
+    normalized_name = _normalize_location_name(candidate_name)
+    if city_name and normalized_name != city_name:
+        return False
+
+    province_name = _normalize_location_name(city_option.province or "")
+    normalized_admin1 = _normalize_location_name(candidate_admin1 or "")
+    if province_name and normalized_admin1:
+        return province_name == normalized_admin1 or province_name in normalized_admin1 or normalized_admin1 in province_name
+    return True
+
+
+def option_has_province_step(continent: str, country: str) -> bool:
+    return any(option.province for option in _CATALOG if option.continent == continent and option.country == country)
+
+
+def default_city_option() -> AgentCityOption:
+    return city_option_from_path(*DEFAULT_CITY_PATH)
+
+
+def _normalize_location_name(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value or ""))
+    ascii_text = "".join(char for char in normalized if not unicodedata.combining(char))
+    compact = ascii_text.strip().lower().replace(" ", "").replace("-", "").replace("'", "")
+    for suffix in (
+        "municipality",
+        "province",
+        "state",
+        "region",
+        "county",
+        "prefecture",
+        "district",
+        "autonomousregion",
+        "specialadministrativeregion",
+        "city",
+    ):
+        compact = compact.replace(suffix, "")
+    return compact
+
+
+def _normalize_sort_key(value: str | None) -> str:
+    return _normalize_location_name(value or "")
+
+
+def _unique_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    output: list[str] = []
+    for value in values:
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        output.append(text)
+        seen.add(text)
+    return output
+
+
+def _unique_lower(values: list[str]) -> list[str]:
+    return [item.lower() for item in _unique_strings(values)]
+
+
+def _unique_preserving_order(values) -> list[str]:
+    seen: set[str] = set()
+    output: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        output.append(value)
+        seen.add(value)
+    return output

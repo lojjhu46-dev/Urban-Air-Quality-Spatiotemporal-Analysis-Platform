@@ -73,6 +73,7 @@ class CollectionRequest:
     pollutants: list[str]
     include_weather: bool = True
     country_code: str | None = None
+    weather_fields: list[str] | None = None
 
     def normalized_pollutants(self) -> list[str]:
         seen: set[str] = set()
@@ -84,6 +85,22 @@ class CollectionRequest:
                 seen.add(key)
         if not normalized:
             normalized = ["pm25"]
+        return normalized
+
+    def normalized_weather_fields(self) -> list[str]:
+        if not self.include_weather:
+            return []
+
+        raw_values = self.weather_fields if self.weather_fields is not None else list(WEATHER_API_FIELDS.keys())
+        seen: set[str] = set()
+        normalized: list[str] = []
+        for item in raw_values:
+            key = str(item).strip().lower()
+            if key in WEATHER_API_FIELDS and key not in seen:
+                normalized.append(key)
+                seen.add(key)
+        if not normalized:
+            normalized = list(WEATHER_API_FIELDS.keys())
         return normalized
 
 
@@ -221,6 +238,7 @@ def search_city_candidates(
 
 def get_collection_agent_tool_schemas(include_run_collection: bool = True) -> list[dict[str, Any]]:
     pollutant_keys = sorted(AQ_AGENT_POLLUTANTS)
+    weather_keys = sorted(WEATHER_API_FIELDS)
 
     search_tool = {
         "type": "function",
@@ -268,6 +286,11 @@ def get_collection_agent_tool_schemas(include_run_collection: bool = True) -> li
                         "minItems": 1,
                     },
                     "include_weather": {"type": "boolean", "description": "Whether to enrich with weather columns."},
+                    "weather_fields": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": weather_keys},
+                        "description": "Optional subset of weather fields to include when include_weather is true.",
+                    },
                     "candidate_index": {
                         "type": "integer",
                         "description": "Index from the last city search result to use as the resolved city candidate.",
@@ -300,6 +323,11 @@ def get_collection_agent_tool_schemas(include_run_collection: bool = True) -> li
                                 "minItems": 1,
                             },
                             "include_weather": {"type": "boolean", "description": "Whether to enrich with weather columns."},
+                            "weather_fields": {
+                                "type": "array",
+                                "items": {"type": "string", "enum": weather_keys},
+                                "description": "Optional subset of weather fields to include when include_weather is true.",
+                            },
                             "candidate_index": {
                                 "type": "integer",
                                 "description": "Index from the last city search result to use as the resolved city candidate.",
@@ -485,6 +513,7 @@ def build_collection_plan(
     language: str = "en",
 ) -> CollectionPlan:
     pollutants = request.normalized_pollutants()
+    weather_fields = request.normalized_weather_fields()
     start_year = int(request.start_year)
     end_year = int(request.end_year)
     if start_year > end_year:
@@ -520,13 +549,13 @@ def build_collection_plan(
         actual_end_date=actual_end.isoformat(),
         pollutants=pollutants,
         pollutant_variables=[AQ_AGENT_POLLUTANTS[key]["api_field"] for key in pollutants],
-        weather_variables=list(WEATHER_API_FIELDS.values()) if request.include_weather else [],
+        weather_variables=[WEATHER_API_FIELDS[key] for key in weather_fields],
         chunks=chunks,
         output_path=str(output_path),
         warnings=warnings,
         planner_mode="deterministic",
         planner_model=None,
-        planner_notes=_default_planner_notes(candidate, pollutants, chunks, request.include_weather, language=language),
+        planner_notes=_default_planner_notes(candidate, pollutants, chunks, weather_fields, language=language),
         quality_checks=[
             t("collection.quality_window", language),
             t("collection.quality_non_null", language),
@@ -883,10 +912,14 @@ def _default_planner_notes(
     candidate: CityCandidate,
     pollutants: list[str],
     chunks: list[dict[str, str]],
-    include_weather: bool,
+    weather_fields: list[str],
     language: str = "en",
 ) -> str:
-    weather_note = t("collection.weather_with", language) if include_weather else t("collection.weather_without", language)
+    weather_note = (
+        t("collection.weather_with_fields", language, fields=", ".join(field.lower() for field in weather_fields))
+        if weather_fields
+        else t("collection.weather_without", language)
+    )
     pollutants_text = ", ".join(pollutant.upper() for pollutant in pollutants)
     return t(
         "collection.default_planner_notes",
@@ -947,7 +980,8 @@ def _default_request_context(default_request: CollectionRequest) -> str:
         "Current UI defaults are available as optional hints, but the user's latest free-text instruction takes priority. "
         f"Defaults: city_query={default_request.city_query!r}, country_code={default_request.country_code!r}, "
         f"start_year={default_request.start_year}, end_year={default_request.end_year}, "
-        f"pollutants={default_request.normalized_pollutants()}, include_weather={default_request.include_weather}."
+        f"pollutants={default_request.normalized_pollutants()}, include_weather={default_request.include_weather}, "
+        f"weather_fields={default_request.normalized_weather_fields()}."
     )
 
 
@@ -959,6 +993,9 @@ def _collection_request_from_tool_arguments(arguments: dict[str, Any]) -> Collec
     pollutants_raw = arguments.get("pollutants") or []
     if not isinstance(pollutants_raw, list):
         raise ValueError("Tool arguments field pollutants must be an array.")
+    weather_fields_raw = arguments.get("weather_fields")
+    if weather_fields_raw is not None and not isinstance(weather_fields_raw, list):
+        raise ValueError("Tool arguments field weather_fields must be an array when provided.")
 
     return CollectionRequest(
         city_query=city_query,
@@ -967,6 +1004,7 @@ def _collection_request_from_tool_arguments(arguments: dict[str, Any]) -> Collec
         pollutants=[str(item) for item in pollutants_raw],
         include_weather=bool(arguments.get("include_weather", True)),
         country_code=_normalize_country_code(arguments.get("country_code")),
+        weather_fields=[str(item) for item in weather_fields_raw] if isinstance(weather_fields_raw, list) else None,
     )
 
 
@@ -1258,7 +1296,10 @@ def _safe_get_json(url: str, params: dict[str, Any], timeout: int = 45) -> dict[
 def _normalize_local_times(values: list[Any], timezone: str) -> pd.Series:
     ts = pd.to_datetime(pd.Series(values), errors="coerce")
     if ts.dt.tz is None:
-        return ts.dt.tz_localize(timezone)
+        # Open-Meteo returns local wall-clock timestamps. Around DST transitions,
+        # some local times do not exist or are ambiguous, so coerce them to NaT
+        # and let chunk loaders drop those rows instead of crashing the run.
+        return ts.dt.tz_localize(timezone, ambiguous="NaT", nonexistent="NaT")
     return ts.dt.tz_convert(timezone)
 
 

@@ -9,6 +9,7 @@ from src.collection_agent import (
     CityCandidate,
     CollectionRequest,
     ToolCallingAgentState,
+    _normalize_local_times,
     build_collection_plan,
     chunk_date_range,
     execute_collection_agent_tool,
@@ -71,6 +72,7 @@ def test_build_collection_plan_for_europe_uses_cams_europe() -> None:
         pollutants=["pm25", "o3"],
         include_weather=True,
         country_code="DE",
+        weather_fields=["temp", "wind_speed"],
     )
 
     plan = build_collection_plan(request, berlin_candidate(), api_key=None)
@@ -79,7 +81,7 @@ def test_build_collection_plan_for_europe_uses_cams_europe() -> None:
     assert plan.actual_start_date == "2013-01-01"
     assert plan.actual_end_date == "2014-12-31"
     assert plan.pollutants == ["pm25", "o3"]
-    assert plan.weather_variables == ["temperature_2m", "relative_humidity_2m", "wind_speed_10m"]
+    assert plan.weather_variables == ["temperature_2m", "wind_speed_10m"]
     assert len(plan.chunks) >= 1
 
 
@@ -88,6 +90,28 @@ def test_chunk_date_range_is_inclusive() -> None:
 
     assert chunks[0] == {"start_date": "2024-01-01", "end_date": "2024-01-30"}
     assert chunks[-1] == {"start_date": "2024-03-31", "end_date": "2024-04-05"}
+
+
+def test_normalize_local_times_drops_nonexistent_dst_hour() -> None:
+    out = _normalize_local_times(
+        ["2023-03-26 01:00:00", "2023-03-26 02:00:00", "2023-03-26 03:00:00"],
+        "Europe/Berlin",
+    )
+
+    assert str(out.iloc[0]) == "2023-03-26 01:00:00+01:00"
+    assert pd.isna(out.iloc[1])
+    assert str(out.iloc[2]) == "2023-03-26 03:00:00+02:00"
+
+
+def test_normalize_local_times_drops_ambiguous_dst_hour() -> None:
+    out = _normalize_local_times(
+        ["2023-10-29 01:00:00", "2023-10-29 02:00:00", "2023-10-29 03:00:00"],
+        "Europe/Berlin",
+    )
+
+    assert str(out.iloc[0]) == "2023-10-29 01:00:00+02:00"
+    assert pd.isna(out.iloc[1])
+    assert str(out.iloc[2]) == "2023-10-29 03:00:00+01:00"
 
 
 def test_finalize_collected_dataset_matches_dashboard_contract() -> None:
@@ -131,6 +155,8 @@ def test_tool_schemas_toggle_run_collection() -> None:
 
     assert names_without_run == ["search_city_candidates", "build_collection_plan"]
     assert names_with_run == ["search_city_candidates", "build_collection_plan", "run_collection"]
+    weather_fields_schema = get_collection_agent_tool_schemas(include_run_collection=True)[1]["function"]["parameters"]["properties"]["weather_fields"]
+    assert weather_fields_schema["items"]["enum"] == ["humidity", "temp", "wind_speed"]
 
 
 def test_execute_collection_agent_tool_build_plan_updates_state(monkeypatch) -> None:
@@ -152,6 +178,7 @@ def test_execute_collection_agent_tool_build_plan_updates_state(monkeypatch) -> 
             "end_year": 2014,
             "pollutants": ["pm25", "o3"],
             "include_weather": True,
+            "weather_fields": ["temp"],
             "candidate_index": 0,
         },
         state=state,
@@ -159,6 +186,7 @@ def test_execute_collection_agent_tool_build_plan_updates_state(monkeypatch) -> 
 
     assert payload["plan"]["city_label"] == "Berlin, Germany"
     assert payload["plan"]["source_domain"] == "cams_europe"
+    assert payload["plan"]["weather_variables"] == ["temperature_2m"]
     assert state.selected_candidate is not None
     assert state.selected_candidate.name == "Berlin"
     assert state.last_plan is not None

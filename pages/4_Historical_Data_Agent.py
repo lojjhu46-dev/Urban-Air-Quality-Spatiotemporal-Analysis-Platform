@@ -1,15 +1,28 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
+from src.agent_interaction import (
+    AgentCityOption,
+    build_agent_instruction,
+    build_city_search_queries,
+    candidate_matches_city_option,
+    city_labels,
+    city_option_from_path,
+    continent_labels,
+    country_labels,
+    default_city_option,
+    option_has_province_step,
+    province_labels,
+)
 from src.charts import trend_figure
-from src.collection_agent import CollectionRequest, collection_plan_from_dict, run_deepseek_tool_agent
-from src.config import AQ_AGENT_DEFAULT_MODEL, DEEPSEEK_BASE_URL
+from src.collection_agent import CollectionRequest, build_collection_plan, collection_plan_from_dict, run_collection_agent, search_city_candidates
+from src.config import AQ_AGENT_DEFAULT_MODEL, AQ_AGENT_POLLUTANTS, DEEPSEEK_BASE_URL
 from src.data import load_dataset
-from src.i18n import api_language, get_language, render_language_selector, t
+from src.i18n import get_language, render_language_selector, t, weather_label
 from src.ui import DATASET_OVERRIDE_KEY, PENDING_DATASET_CHOICE_KEY, dataset_path_from_env, render_dataframe
 
 language = get_language()
@@ -24,14 +37,18 @@ st.title(t("agent.title", language))
 st.caption(t("agent.caption", language))
 
 CURRENT_YEAR = pd.Timestamp.today().year
-DEFAULT_YEARS = (max(2022, CURRENT_YEAR - 2), CURRENT_YEAR)
-DEFAULT_POLLUTANTS = ["pm25", "pm10", "no2", "so2", "co", "o3"]
-default_instruction = t(
-    "agent.default_instruction",
-    language,
-    start_year=DEFAULT_YEARS[0],
-    end_year=DEFAULT_YEARS[1],
-)
+DEFAULT_CITY_OPTION = default_city_option()
+DEFAULT_POLLUTANTS = list(AQ_AGENT_POLLUTANTS)
+DEFAULT_WEATHER_FIELDS = ["temp", "humidity", "wind_speed"]
+
+CONTINENT_KEY = "aq_agent_continent"
+COUNTRY_KEY = "aq_agent_country"
+PROVINCE_KEY = "aq_agent_province"
+CITY_KEY = "aq_agent_city"
+YEARS_KEY = "aq_agent_year_range"
+POLLUTANTS_KEY = "aq_agent_pollutants"
+WEATHER_FIELDS_KEY = "aq_agent_weather_fields"
+USE_DEEPSEEK_KEY = "aq_agent_use_deepseek"
 
 
 def _safe_secret(key: str) -> str | None:
@@ -45,18 +62,10 @@ def _safe_secret(key: str) -> str | None:
     return text or None
 
 
-def _current_request() -> CollectionRequest:
-    return CollectionRequest(
-        city_query="Beijing",
-        start_year=int(DEFAULT_YEARS[0]),
-        end_year=int(DEFAULT_YEARS[1]),
-        pollutants=DEFAULT_POLLUTANTS,
-        include_weather=True,
-        country_code="CN",
-    )
-
-
 def _planner_api_key() -> str | None:
+    enabled = bool(st.session_state.get(USE_DEEPSEEK_KEY, bool(_safe_secret("deepseek_api_key"))))
+    if not enabled:
+        return None
     return _safe_secret("deepseek_api_key")
 
 
@@ -66,6 +75,98 @@ def _planner_model() -> str:
 
 def _planner_base_url() -> str:
     return str(st.session_state.get("aq_agent_base_url", DEEPSEEK_BASE_URL)).strip() or DEEPSEEK_BASE_URL
+
+
+def _ensure_state_value(key: str, options: list[str], default_value: str) -> None:
+    if not options:
+        st.session_state.pop(key, None)
+        return
+    if st.session_state.get(key) not in options:
+        st.session_state[key] = default_value if default_value in options else options[0]
+
+
+def _current_city_option() -> AgentCityOption:
+    return city_option_from_path(
+        st.session_state[CONTINENT_KEY],
+        st.session_state[COUNTRY_KEY],
+        st.session_state.get(PROVINCE_KEY) or None,
+        st.session_state[CITY_KEY],
+    )
+
+
+def _selected_years() -> tuple[int, int]:
+    city_option = _current_city_option()
+    default_start = max(city_option.supported_start_year, CURRENT_YEAR - 2)
+    default_value = (default_start, CURRENT_YEAR)
+    value = st.session_state.get(YEARS_KEY, default_value)
+    start_year = max(int(value[0]), city_option.supported_start_year)
+    end_year = min(int(value[1]), CURRENT_YEAR)
+    if start_year > end_year:
+        start_year = city_option.supported_start_year
+    return start_year, end_year
+
+
+def _prime_year_state() -> None:
+    st.session_state[YEARS_KEY] = _selected_years()
+
+
+def _selected_pollutants() -> list[str]:
+    values = st.session_state.get(POLLUTANTS_KEY, DEFAULT_POLLUTANTS)
+    normalized = [str(item) for item in values if str(item) in AQ_AGENT_POLLUTANTS]
+    return normalized or ["pm25"]
+
+
+def _selected_weather_fields() -> list[str]:
+    values = st.session_state.get(WEATHER_FIELDS_KEY, DEFAULT_WEATHER_FIELDS)
+    normalized = [str(item) for item in values if str(item) in DEFAULT_WEATHER_FIELDS]
+    return normalized
+
+
+def _current_request() -> CollectionRequest:
+    city_option = _current_city_option()
+    start_year, end_year = _selected_years()
+    weather_fields = _selected_weather_fields()
+    return CollectionRequest(
+        city_query=city_option.city_query,
+        start_year=start_year,
+        end_year=end_year,
+        pollutants=_selected_pollutants(),
+        include_weather=bool(weather_fields),
+        country_code=city_option.country_code,
+        weather_fields=weather_fields,
+    )
+
+
+def _current_instruction() -> str:
+    city_option = _current_city_option()
+    start_year, end_year = _selected_years()
+    return build_agent_instruction(
+        city_option,
+        start_year,
+        end_year,
+        _selected_pollutants(),
+        _selected_weather_fields(),
+        language=language,
+    )
+
+
+def _resolve_selected_candidate() -> object:
+    city_option = _current_city_option()
+    latest_candidates = []
+    for query in build_city_search_queries(city_option):
+        candidates = search_city_candidates(query, country_code=city_option.country_code, count=10, language="en")
+        latest_candidates = candidates
+        for candidate in candidates:
+            if candidate_matches_city_option(
+                city_option,
+                candidate_name=candidate.name,
+                candidate_admin1=candidate.admin1,
+                candidate_country_code=candidate.country_code,
+            ):
+                return candidate
+    if latest_candidates:
+        return latest_candidates[0]
+    raise ValueError(t("agent.city_not_found", language, city=city_option.path_label))
 
 
 def _remember_plan(plan) -> None:
@@ -116,6 +217,11 @@ def _render_plan(plan) -> None:
     with left:
         st.write(t("agent.planned_pollutants", language))
         st.write(", ".join(pollutant.upper() for pollutant in plan.pollutants))
+        st.write(t("agent.weather_fields_label", language))
+        if plan.weather_variables:
+            st.write(", ".join(variable for variable in plan.weather_variables))
+        else:
+            st.write(t("agent.no_weather_fields", language))
         if plan.quality_checks:
             st.write(t("agent.quality_checks", language))
             for item in plan.quality_checks:
@@ -129,71 +235,146 @@ def _render_plan(plan) -> None:
         render_dataframe(pd.DataFrame(plan.chunks), use_container_width=True, hide_index=True)
 
 
+continent_options = continent_labels()
+_ensure_state_value(CONTINENT_KEY, continent_options, DEFAULT_CITY_OPTION.continent)
+
+country_options = country_labels(st.session_state[CONTINENT_KEY])
+_ensure_state_value(COUNTRY_KEY, country_options, DEFAULT_CITY_OPTION.country)
+
+province_required = option_has_province_step(st.session_state[CONTINENT_KEY], st.session_state[COUNTRY_KEY])
+province_options = province_labels(st.session_state[CONTINENT_KEY], st.session_state[COUNTRY_KEY])
+if province_required:
+    _ensure_state_value(PROVINCE_KEY, province_options, DEFAULT_CITY_OPTION.province or province_options[0])
+else:
+    st.session_state[PROVINCE_KEY] = ""
+
+available_city_labels = city_labels(
+    st.session_state[CONTINENT_KEY],
+    st.session_state[COUNTRY_KEY],
+    st.session_state.get(PROVINCE_KEY) or None,
+)
+_ensure_state_value(CITY_KEY, available_city_labels, DEFAULT_CITY_OPTION.city)
+_prime_year_state()
+
 with st.expander(t("agent.deepseek_settings", language), expanded=False):
     st.text_input(t("agent.model", language), value=_safe_secret("deepseek_model") or AQ_AGENT_DEFAULT_MODEL, key="aq_agent_model")
     st.text_input(t("agent.base_url", language), value=_safe_secret("deepseek_base_url") or DEEPSEEK_BASE_URL, key="aq_agent_base_url")
     if _safe_secret("deepseek_api_key"):
+        st.checkbox(t("agent.use_deepseek"), value=True, key=USE_DEEPSEEK_KEY)
         st.success(t("agent.api_key_found", language))
     else:
-        st.warning(t("agent.api_key_missing", language))
+        st.checkbox(t("agent.use_deepseek"), value=False, key=USE_DEEPSEEK_KEY, disabled=True)
+        st.info(t("agent.api_key_optional", language))
 
-st.subheader(t("agent.natural_section", language))
-st.caption(t("agent.natural_caption", language))
-st.text_area(
-    t("agent.instruction", language),
-    value=st.session_state.get("aq_agent_instruction", default_instruction),
-    key="aq_agent_instruction",
-    height=110,
+st.subheader(t("agent.request_section", language))
+st.caption(t("agent.request_caption", language))
+
+row1_left, row1_right = st.columns((1, 1))
+with row1_left:
+    st.selectbox(t("agent.continent_select", language), options=continent_options, key=CONTINENT_KEY)
+with row1_right:
+    st.selectbox(t("agent.country_select", language), options=country_options, key=COUNTRY_KEY)
+
+row2_left, row2_right = st.columns((1, 1))
+with row2_left:
+    if province_required:
+        st.selectbox(t("agent.province_select", language), options=province_options, key=PROVINCE_KEY)
+    else:
+        st.text_input(t("agent.province_select", language), value=t("agent.province_skip", language), disabled=True)
+with row2_right:
+    st.selectbox(t("agent.city_select", language), options=available_city_labels, key=CITY_KEY)
+
+selected_city = _current_city_option()
+source_name, source_window = selected_city.source_summary
+st.caption(t("agent.city_catalog_hint", language))
+st.info(
+    t(
+        "agent.support_window",
+        language,
+        path=selected_city.path_label,
+        source=source_name,
+        window=source_window,
+    )
 )
+
+left, right = st.columns((1, 1))
+with left:
+    st.slider(
+        t("agent.year_range", language),
+        min_value=selected_city.supported_start_year,
+        max_value=CURRENT_YEAR,
+        key=YEARS_KEY,
+    )
+with right:
+    st.multiselect(
+        t("agent.pollutants_select", language),
+        options=DEFAULT_POLLUTANTS,
+        default=DEFAULT_POLLUTANTS,
+        key=POLLUTANTS_KEY,
+    )
+
+st.multiselect(
+    t("agent.weather_select", language),
+    options=DEFAULT_WEATHER_FIELDS,
+    default=DEFAULT_WEATHER_FIELDS,
+    format_func=lambda key: weather_label(key, language),
+    key=WEATHER_FIELDS_KEY,
+)
+
+with st.expander(t("agent.request_preview", language), expanded=False):
+    st.caption(t("agent.request_preview_caption", language))
+    st.code(_current_instruction(), language="text")
 
 agent_left, agent_right = st.columns((1, 1))
 agent_plan_clicked = agent_left.button(t("agent.draft_plan", language), use_container_width=True)
 agent_collect_clicked = agent_right.button(t("agent.plan_and_collect", language), type="primary", use_container_width=True)
 
 if agent_plan_clicked or agent_collect_clicked:
+    progress = st.progress(0)
+    status = st.empty()
+    request = _current_request()
     api_key = _planner_api_key()
-    if not api_key:
-        st.error(t("agent.tool_requires_key", language))
-    else:
-        progress = st.progress(0)
-        status = st.empty()
 
-        def _progress(step: int, total: int, message: str) -> None:
-            progress.progress(min(step / max(total, 1), 1.0))
-            status.caption(message)
+    def _progress(step: int, total: int, message: str) -> None:
+        progress.progress(min(step / max(total, 1), 1.0))
+        status.caption(message)
 
-        try:
-            agent_result = run_deepseek_tool_agent(
-                st.session_state.get("aq_agent_instruction", ""),
+    try:
+        progress.progress(0.08)
+        status.caption(t("agent.resolving_city", language))
+        candidate = _resolve_selected_candidate()
+        progress.progress(0.18)
+        status.caption(t("agent.building_plan", language))
+        if agent_collect_clicked:
+            result = run_collection_agent(
+                request,
+                candidate,
                 api_key=api_key,
                 model=_planner_model(),
                 base_url=_planner_base_url(),
-                default_request=_current_request(),
-                allow_run_collection=agent_collect_clicked,
                 progress_callback=_progress,
-                search_language=api_language(language),
                 language=language,
             )
-        except Exception as exc:  # noqa: BLE001
-            progress.empty()
-            status.empty()
-            st.error(t("agent.tool_failed", language, error=exc))
-        else:
+            _remember_collection_result(result)
             progress.progress(1.0)
             status.success(t("agent.tool_completed", language))
-            st.session_state["aq_agent_tool_reply"] = agent_result.assistant_message
-            st.session_state["aq_agent_tool_trace"] = agent_result.tool_trace
-            if agent_result.state.last_plan is not None:
-                _remember_plan(agent_result.state.last_plan)
-            if agent_result.state.last_result is not None:
-                _remember_collection_result(agent_result.state.last_result)
-                st.rerun()
-
-stored_tool_reply = st.session_state.get("aq_agent_tool_reply")
-if stored_tool_reply:
-    st.write(stored_tool_reply)
-    with st.expander(t("agent.tool_trace", language), expanded=False):
-        st.json(st.session_state.get("aq_agent_tool_trace", []), expanded=False)
+            st.rerun()
+        else:
+            plan = build_collection_plan(
+                request,
+                candidate,
+                api_key=api_key,
+                model=_planner_model(),
+                base_url=_planner_base_url(),
+                language=language,
+            )
+            _remember_plan(plan)
+            progress.progress(1.0)
+            status.success(t("agent.tool_completed", language))
+    except Exception as exc:  # noqa: BLE001
+        progress.empty()
+        status.empty()
+        st.error(t("agent.tool_failed", language, error=exc))
 
 stored_plan = st.session_state.get("aq_agent_plan")
 if stored_plan:
