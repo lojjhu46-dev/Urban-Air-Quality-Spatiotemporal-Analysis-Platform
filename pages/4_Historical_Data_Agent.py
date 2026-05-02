@@ -19,6 +19,7 @@ from src.agent_interaction import (
     province_labels,
 )
 from src.charts import trend_figure
+from src.china_city_catalog import china_city_display_name, china_province_display_name
 from src.collection_agent import CollectionRequest, build_collection_plan, collection_plan_from_dict, run_collection_agent, search_city_candidates
 from src.config import AQ_AGENT_DEFAULT_MODEL, AQ_AGENT_POLLUTANTS, DEEPSEEK_BASE_URL
 from src.data import load_dataset
@@ -150,6 +151,18 @@ def _current_instruction() -> str:
     )
 
 
+def _format_province_option(province: str) -> str:
+    if st.session_state.get(COUNTRY_KEY) == "China":
+        return china_province_display_name(province, language) or province
+    return province
+
+
+def _format_city_option(city: str) -> str:
+    if st.session_state.get(COUNTRY_KEY) == "China":
+        return china_city_display_name(st.session_state.get(PROVINCE_KEY) or None, city, language)
+    return city
+
+
 def _resolve_selected_candidate() -> object:
     city_option = _current_city_option()
     latest_candidates = []
@@ -166,7 +179,7 @@ def _resolve_selected_candidate() -> object:
                 return candidate
     if latest_candidates:
         return latest_candidates[0]
-    raise ValueError(t("agent.city_not_found", language, city=city_option.path_label))
+    raise ValueError(t("agent.city_not_found", language, city=city_option.path_label_for_language(language)))
 
 
 def _remember_plan(plan) -> None:
@@ -278,11 +291,21 @@ with row1_right:
 row2_left, row2_right = st.columns((1, 1))
 with row2_left:
     if province_required:
-        st.selectbox(t("agent.province_select", language), options=province_options, key=PROVINCE_KEY)
+        st.selectbox(
+            t("agent.province_select", language),
+            options=province_options,
+            format_func=_format_province_option,
+            key=PROVINCE_KEY,
+        )
     else:
         st.text_input(t("agent.province_select", language), value=t("agent.province_skip", language), disabled=True)
 with row2_right:
-    st.selectbox(t("agent.city_select", language), options=available_city_labels, key=CITY_KEY)
+    st.selectbox(
+        t("agent.city_select", language),
+        options=available_city_labels,
+        format_func=_format_city_option,
+        key=CITY_KEY,
+    )
 
 selected_city = _current_city_option()
 source_name, source_window = selected_city.source_summary
@@ -291,11 +314,13 @@ st.info(
     t(
         "agent.support_window",
         language,
-        path=selected_city.path_label,
+        path=selected_city.path_label_for_language(language),
         source=source_name,
         window=source_window,
     )
 )
+if selected_city.country_code == "CN" and _planner_api_key():
+    st.caption(t("agent.deepseek_proxy_hint", language))
 
 left, right = st.columns((1, 1))
 with left:

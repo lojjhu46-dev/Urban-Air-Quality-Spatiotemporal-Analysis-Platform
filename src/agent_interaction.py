@@ -3,7 +3,19 @@ from __future__ import annotations
 import unicodedata
 from dataclasses import dataclass
 
+from src.china_city_catalog import (
+    MAINLAND_CHINA_CITY_ROWS,
+    TOTAL_PRC_PREFECTURE_LEVEL_CITIES,
+    china_city_display_name,
+    china_province_display_name,
+)
 from src.config import EUROPE_COUNTRY_CODES
+
+
+def _normalize_catalog_token(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value or ""))
+    ascii_text = "".join(char for char in normalized if not unicodedata.combining(char))
+    return ascii_text.strip().lower().replace(" ", "").replace("-", "").replace("'", "")
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,10 +34,24 @@ class AgentCityOption:
 
     @property
     def path_label(self) -> str:
+        return self.path_label_for_language()
+
+    def display_province(self, language: str = "en") -> str | None:
+        if self.country_code.upper() == "CN":
+            return china_province_display_name(self.province, language)
+        return self.province
+
+    def display_city(self, language: str = "en") -> str:
+        if self.country_code.upper() == "CN":
+            return china_city_display_name(self.province, self.city, language)
+        return self.city
+
+    def path_label_for_language(self, language: str = "en") -> str:
         parts = [self.continent, self.country]
-        if self.province:
-            parts.append(self.province)
-        parts.append(self.city)
+        province = self.display_province(language)
+        if province:
+            parts.append(province)
+        parts.append(self.display_city(language))
         return " - ".join(parts)
 
     @property
@@ -39,18 +65,25 @@ class AgentCityOption:
         return "Open-Meteo Global", "3-hourly since 2022-08-01"
 
 
+_CHINA_CITY_OPTIONS = tuple(
+    AgentCityOption(
+        "Asia",
+        "China",
+        province,
+        city,
+        "CN",
+        _normalize_catalog_token(city),
+        query=query,
+    )
+    for province, city, query in MAINLAND_CHINA_CITY_ROWS
+)
+
+
 _CATALOG = (
     AgentCityOption("Africa", "Kenya", "Nairobi County", "Nairobi", "KE", "nairobi"),
     AgentCityOption("Africa", "South Africa", "Gauteng", "Johannesburg", "ZA", "johannesburg"),
     AgentCityOption("Africa", "South Africa", "Western Cape", "Cape Town", "ZA", "cape-town"),
-    AgentCityOption("Asia", "China", "Beijing Municipality", "Beijing", "CN", "beijing"),
-    AgentCityOption("Asia", "China", "Sichuan", "Chengdu", "CN", "chengdu"),
-    AgentCityOption("Asia", "China", "Guangdong", "Guangzhou", "CN", "guangzhou"),
-    AgentCityOption("Asia", "China", "Zhejiang", "Hangzhou", "CN", "hangzhou"),
-    AgentCityOption("Asia", "China", "Shaanxi", "Xi'an", "CN", "xian", query="Xian"),
-    AgentCityOption("Asia", "China", "Shanghai Municipality", "Shanghai", "CN", "shanghai"),
-    AgentCityOption("Asia", "China", "Guangdong", "Shenzhen", "CN", "shenzhen"),
-    AgentCityOption("Asia", "China", "Hubei", "Wuhan", "CN", "wuhan"),
+    *_CHINA_CITY_OPTIONS,
     AgentCityOption("Asia", "India", "Karnataka", "Bengaluru", "IN", "bengaluru"),
     AgentCityOption("Asia", "India", "Delhi", "Delhi", "IN", "delhi"),
     AgentCityOption("Asia", "India", "Maharashtra", "Mumbai", "IN", "mumbai"),
@@ -163,14 +196,14 @@ def build_agent_instruction(
     if language == "zh-CN":
         weather_clause = f"附加气象字段 {weather_text}" if weather_text else "不附加气象字段"
         return (
-            f"目标城市限定为 {city_option.path_label}。"
+            f"目标城市限定为 {city_option.path_label_for_language(language)}。"
             f"请采集 {start_year} 年到 {end_year} 年的 {pollutant_text} 历史空气质量数据，"
             f"{weather_clause}，并保存为当前 dashboard 可直接加载的数据集。"
         )
 
     weather_clause = f"include weather fields {weather_text}" if weather_text else "skip weather fields"
     return (
-        f"Limit the target city to {city_option.path_label}. "
+        f"Limit the target city to {city_option.path_label_for_language(language)}. "
         f"Collect historical air-quality data for {pollutant_text} from {start_year} to {end_year}, "
         f"{weather_clause}, and save a dataset that the current dashboard can load directly."
     )
@@ -218,10 +251,36 @@ def default_city_option() -> AgentCityOption:
     return city_option_from_path(*DEFAULT_CITY_PATH)
 
 
+def china_city_count() -> int:
+    return len(_CHINA_CITY_OPTIONS)
+
+
+def china_city_coverage_ratio() -> float:
+    return china_city_count() / TOTAL_PRC_PREFECTURE_LEVEL_CITIES
+
+
+def china_province_labels() -> list[str]:
+    return sorted({option.province for option in _CHINA_CITY_OPTIONS if option.province}, key=_normalize_sort_key)
+
+
+def resolve_china_catalog_province(value: str | None) -> str | None:
+    normalized = _normalize_location_name(value or "")
+    for province in china_province_labels():
+        province_key = _normalize_location_name(province)
+        if normalized == province_key or normalized in province_key or province_key in normalized:
+            return province
+    return None
+
+
+def china_province_city_names(province: str | None) -> list[str]:
+    matched_province = resolve_china_catalog_province(province)
+    if not matched_province:
+        return []
+    return [option.city for option in city_options("Asia", "China", matched_province)]
+
+
 def _normalize_location_name(value: str) -> str:
-    normalized = unicodedata.normalize("NFKD", str(value or ""))
-    ascii_text = "".join(char for char in normalized if not unicodedata.combining(char))
-    compact = ascii_text.strip().lower().replace(" ", "").replace("-", "").replace("'", "")
+    compact = _normalize_catalog_token(value)
     for suffix in (
         "municipality",
         "province",

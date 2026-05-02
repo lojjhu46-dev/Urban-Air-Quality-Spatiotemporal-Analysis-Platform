@@ -24,6 +24,7 @@ from src.config import (
     OPEN_METEO_WEATHER_ARCHIVE_URL,
     POLLUTANT_COLUMNS,
 )
+from src.agent_interaction import china_province_city_names, resolve_china_catalog_province
 from src.data import output_dataset_path, write_dataset as write_tabular_dataset
 from src.i18n import t
 
@@ -603,24 +604,95 @@ def run_collection_agent(
         output_dir=output_dir,
         language=language,
     )
+    final_df, runtime_warnings = _collect_candidate_dataset(
+        plan,
+        candidate,
+        progress_callback=progress_callback,
+        language=language,
+    )
+    coverage_rows = summarize_dataset_coverage(final_df, plan.pollutants)
 
+    if not _has_usable_coverage_rows(coverage_rows):
+        fallback = _maybe_collect_with_deepseek_proxy(
+            request,
+            candidate,
+            initial_warnings=runtime_warnings,
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+            output_dir=output_dir,
+            language=language,
+            progress_callback=progress_callback,
+        )
+        if fallback is not None:
+            plan, final_df, runtime_warnings, coverage_rows = fallback
+        elif final_df.empty:
+            raise ValueError(t("collection.no_rows", language))
+        else:
+            raise ValueError(t("collection.no_usable_rows", language))
+
+    actual_output_path = save_dataset(final_df, Path(plan.output_path))
+    plan.output_path = str(actual_output_path)
+    summary_text, summary_mode = generate_collection_summary(
+        final_df,
+        plan,
+        coverage_rows,
+        runtime_warnings=runtime_warnings,
+        api_key=api_key,
+        model=model,
+        base_url=base_url,
+        language=language,
+    )
+    _notify(progress_callback, 1, 1, t("collection.progress_saved", language, path=plan.output_path))
+
+    return CollectionResult(
+        plan=plan,
+        dataset=final_df,
+        output_path=plan.output_path,
+        row_count=len(final_df),
+        started_at=str(final_df["timestamp"].min()),
+        ended_at=str(final_df["timestamp"].max()),
+        coverage_rows=coverage_rows,
+        runtime_warnings=runtime_warnings,
+        summary_text=summary_text,
+        summary_mode=summary_mode,
+    )
+
+
+def _collect_candidate_dataset(
+    plan: CollectionPlan,
+    candidate: CityCandidate,
+    *,
+    progress_callback: ProgressCallback | None = None,
+    language: str = "en",
+) -> tuple[pd.DataFrame, list[str]]:
     aq_frames: list[pd.DataFrame] = []
     weather_frames: list[pd.DataFrame] = []
     runtime_warnings: list[str] = []
 
-    total_steps = len(plan.chunks) + (len(plan.chunks) if plan.weather_variables else 0) + 2
+    total_steps = len(plan.chunks) + (len(plan.chunks) if plan.weather_variables else 0) + 1
     step = 0
 
     for chunk in plan.chunks:
         step += 1
-        _notify(progress_callback, step, total_steps, t("collection.progress_air_quality", language, start=chunk["start_date"], end=chunk["end_date"]))
+        _notify(
+            progress_callback,
+            step,
+            total_steps,
+            t("collection.progress_air_quality", language, start=chunk["start_date"], end=chunk["end_date"]),
+        )
         aq_frame = fetch_air_quality_chunk(plan, chunk)
         if not aq_frame.empty:
             aq_frames.append(aq_frame)
 
         if plan.weather_variables:
             step += 1
-            _notify(progress_callback, step, total_steps, t("collection.progress_weather", language, start=chunk["start_date"], end=chunk["end_date"]))
+            _notify(
+                progress_callback,
+                step,
+                total_steps,
+                t("collection.progress_weather", language, start=chunk["start_date"], end=chunk["end_date"]),
+            )
             try:
                 weather_frame = fetch_weather_chunk(plan, chunk)
             except Exception as exc:  # noqa: BLE001
@@ -637,11 +709,10 @@ def run_collection_agent(
                 if not weather_frame.empty:
                     weather_frames.append(weather_frame)
 
-    step += 1
-    _notify(progress_callback, step, total_steps, t("collection.progress_merge", language))
+    _notify(progress_callback, total_steps, total_steps, t("collection.progress_merge", language))
     air_quality_df = _concat_unique_frames(aq_frames)
     if air_quality_df.empty:
-        raise ValueError(t("collection.no_rows", language))
+        return pd.DataFrame(columns=["timestamp", *plan.pollutants]), runtime_warnings
 
     weather_df = _concat_unique_frames(weather_frames)
     final_df = finalize_collected_dataset(
@@ -651,37 +722,112 @@ def run_collection_agent(
         latitude=candidate.latitude,
         longitude=candidate.longitude,
     )
+    return final_df, runtime_warnings
 
-    actual_output_path = save_dataset(final_df, Path(plan.output_path))
-    plan.output_path = str(actual_output_path)
 
-    coverage_rows = summarize_dataset_coverage(final_df, plan.pollutants)
-    summary_text, summary_mode = generate_collection_summary(
-        final_df,
-        plan,
-        coverage_rows,
-        runtime_warnings=runtime_warnings,
+def _maybe_collect_with_deepseek_proxy(
+    request: CollectionRequest,
+    candidate: CityCandidate,
+    *,
+    initial_warnings: list[str],
+    api_key: str | None,
+    model: str,
+    base_url: str,
+    output_dir: Path,
+    language: str,
+    progress_callback: ProgressCallback | None,
+) -> tuple[CollectionPlan, pd.DataFrame, list[str], list[dict[str, Any]]] | None:
+    source_province = _candidate_catalog_province(candidate)
+    if not api_key or not source_province or len(china_province_city_names(source_province)) < 2:
+        return None
+
+    warning_prefix = t(
+        "collection.deepseek_proxy_attempt",
+        language,
+        requested=candidate.display_name,
+        province=source_province,
+    )
+    _notify(progress_callback, 0, 1, warning_prefix)
+
+    proxy_plan = _generate_proxy_city_plan(
+        request,
+        candidate,
+        province=source_province,
         api_key=api_key,
         model=model,
         base_url=base_url,
         language=language,
     )
+    if not proxy_plan:
+        return None
 
-    step += 1
-    _notify(progress_callback, step, total_steps, t("collection.progress_saved", language, path=plan.output_path))
+    combined_warnings = _unique_strings([*initial_warnings, warning_prefix])
+    note = str(proxy_plan.get("note") or "").strip()
+    if note:
+        combined_warnings.append(note)
 
-    return CollectionResult(
-        plan=plan,
-        dataset=final_df,
-        output_path=plan.output_path,
-        row_count=len(final_df),
-        started_at=str(final_df["timestamp"].min()),
-        ended_at=str(final_df["timestamp"].max()),
-        coverage_rows=coverage_rows,
-        runtime_warnings=runtime_warnings,
-        summary_text=summary_text,
-        summary_mode=summary_mode,
+    query_values = _unique_strings(
+        [
+            *list(proxy_plan.get("query_variants") or []),
+            *list(proxy_plan.get("proxy_city_names") or []),
+        ]
     )
+    for query in query_values:
+        try:
+            candidates = search_city_candidates(query, country_code=request.country_code or candidate.country_code, count=5, language="en")
+        except Exception:  # noqa: BLE001
+            continue
+
+        for proxy_candidate in candidates:
+            if _candidate_catalog_province(proxy_candidate) != source_province:
+                continue
+            if _same_candidate(candidate, proxy_candidate):
+                continue
+
+            proxy_run = _collect_proxy_candidate(
+                request,
+                proxy_candidate,
+                output_dir=output_dir,
+                language=language,
+            )
+            if proxy_run is None:
+                continue
+
+            proxy_plan_result, proxy_df, proxy_warnings, proxy_coverage = proxy_run
+            proxy_warning = t(
+                "collection.deepseek_proxy_used",
+                language,
+                requested=candidate.display_name,
+                actual=proxy_candidate.display_name,
+            )
+            proxy_plan_result.warnings = _unique_strings([*proxy_plan_result.warnings, proxy_warning])
+            proxy_plan_result.risk_flags = _unique_strings([*(proxy_plan_result.risk_flags or []), proxy_warning])
+            proxy_warnings = _unique_strings([*combined_warnings, *proxy_warnings, proxy_warning])
+            return proxy_plan_result, proxy_df, proxy_warnings, proxy_coverage
+
+    combined_warnings.append(t("collection.deepseek_proxy_failed", language))
+    return None
+
+
+def _collect_proxy_candidate(
+    request: CollectionRequest,
+    candidate: CityCandidate,
+    *,
+    output_dir: Path,
+    language: str,
+) -> tuple[CollectionPlan, pd.DataFrame, list[str], list[dict[str, Any]]] | None:
+    proxy_plan = build_collection_plan(
+        request,
+        candidate,
+        api_key=None,
+        output_dir=output_dir,
+        language=language,
+    )
+    proxy_df, proxy_warnings = _collect_candidate_dataset(proxy_plan, candidate, progress_callback=None, language=language)
+    proxy_coverage = summarize_dataset_coverage(proxy_df, proxy_plan.pollutants)
+    if not _has_usable_coverage_rows(proxy_coverage):
+        return None
+    return proxy_plan, proxy_df, proxy_warnings, proxy_coverage
 
 
 def resolve_supported_window(
@@ -864,6 +1010,82 @@ def summarize_dataset_coverage(df: pd.DataFrame, pollutants: list[str]) -> list[
             }
         )
     return rows
+
+
+def _has_usable_coverage_rows(rows: list[dict[str, Any]]) -> bool:
+    return any(float(row.get("non_null_ratio") or 0.0) > 0.0 for row in rows)
+
+
+def _candidate_catalog_province(candidate: CityCandidate) -> str | None:
+    if candidate.country_code.upper() != "CN":
+        return None
+    return resolve_china_catalog_province(candidate.admin1 or "")
+
+
+def _same_candidate(left: CityCandidate, right: CityCandidate) -> bool:
+    if left.open_meteo_id is not None and right.open_meteo_id is not None:
+        return left.open_meteo_id == right.open_meteo_id
+    return (
+        _normalize_location_key(left.name) == _normalize_location_key(right.name)
+        and _normalize_location_key(left.admin1 or "") == _normalize_location_key(right.admin1 or "")
+        and left.country_code.upper() == right.country_code.upper()
+    )
+
+
+def _generate_proxy_city_plan(
+    request: CollectionRequest,
+    candidate: CityCandidate,
+    *,
+    province: str,
+    api_key: str,
+    model: str,
+    base_url: str,
+    language: str = "en",
+) -> dict[str, Any] | None:
+    reply_language = "Simplified Chinese" if language == "zh-CN" else "English"
+    allowed_cities = ", ".join(china_province_city_names(province))
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You help recover sparse air-quality coverage for curated mainland China cities. "
+                "Return JSON only with keys query_variants, proxy_city_names, note. "
+                "Do not invent measurements. Only suggest curated same-province municipalities or prefecture-level cities. "
+                f"Write note in {reply_language}."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "The requested city returned no usable air-quality coverage from the current source. "
+                "Suggest query aliases and nearby same-province proxy cities that are likely to have stable coverage.\n"
+                f"Requested city: {candidate.display_name}\n"
+                f"Province: {province}\n"
+                f"Original query: {request.city_query}\n"
+                f"Allowed same-province cities: {allowed_cities}\n"
+                "Return at most 4 query_variants and at most 3 proxy_city_names."
+            ),
+        },
+    ]
+    data = _deepseek_json_completion(messages, api_key=api_key, model=model, base_url=base_url, timeout=90)
+    if not data:
+        return None
+
+    allowed_keys = {_normalize_location_key(city) for city in china_province_city_names(province)}
+    proxy_names = [
+        str(item).strip()
+        for item in list(data.get("proxy_city_names") or [])
+        if _normalize_location_key(item) in allowed_keys
+    ]
+    query_variants = [str(item).strip() for item in list(data.get("query_variants") or []) if str(item).strip()]
+    note = str(data.get("note") or "").strip()
+    if not proxy_names and not query_variants:
+        return None
+    return {
+        "proxy_city_names": _unique_strings(proxy_names),
+        "query_variants": _unique_strings(query_variants),
+        "note": note,
+    }
 
 
 def generate_collection_summary(
@@ -1338,5 +1560,11 @@ def _unique_strings(values: list[str]) -> list[str]:
 def _normalize_country_code(value: Any) -> str | None:
     text = str(value or "").strip().upper()
     return text or None
+
+
+def _normalize_location_key(value: Any) -> str:
+    lowered = str(value or "").strip().lower()
+    collapsed = re.sub(r"[^a-z0-9]+", "", lowered)
+    return collapsed.replace("province", "").replace("city", "")
 
 

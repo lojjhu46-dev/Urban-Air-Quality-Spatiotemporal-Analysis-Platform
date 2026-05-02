@@ -85,7 +85,7 @@ TRANSLATIONS = {
     "agent.risk_flags": {"zh-CN": "\u98ce\u9669\u63d0\u793a", "en": "Risk flags"},
     "agent.chunk_preview": {"zh-CN": "\u5206\u6bb5\u65f6\u95f4\u9884\u89c8", "en": "Chunk window preview"},
     "agent.deepseek_settings": {"zh-CN": "DeepSeek \u8bbe\u7f6e", "en": "DeepSeek Settings"},
-    "agent.use_deepseek": {"zh-CN": "\u5f53 API key \u53ef\u7528\u65f6\uff0c\u4f7f\u7528 DeepSeek \u589e\u5f3a\u8ba1\u5212\u8bf4\u660e\u548c\u8fd0\u884c\u6458\u8981", "en": "Use DeepSeek to enhance the plan notes and run summary when the API key is configured"},
+    "agent.use_deepseek": {"zh-CN": "\u5f53 API key \u53ef\u7528\u65f6\uff0c\u4f7f\u7528 DeepSeek \u589e\u5f3a\u8ba1\u5212\u8bf4\u660e\u3001\u8fd0\u884c\u6458\u8981\uff0c\u5e76\u5728\u4e2d\u56fd\u57ce\u5e02\u8986\u76d6\u8f83\u5f31\u65f6\u5c1d\u8bd5\u540c\u7701\u4ee3\u7406\u8865\u4f4d", "en": "Use DeepSeek to enhance plan notes, run summaries, and same-province China proxy recovery when the API key is configured"},
     "agent.model": {"zh-CN": "\u6a21\u578b", "en": "Model"},
     "agent.base_url": {"zh-CN": "Base URL", "en": "Base URL"},
     "agent.api_key_found": {"zh-CN": "\u5df2\u5728 Streamlit secrets \u4e2d\u53d1\u73b0 `deepseek_api_key`\u3002", "en": "Found `deepseek_api_key` in Streamlit secrets."},
@@ -98,8 +98,9 @@ TRANSLATIONS = {
     "agent.province_select": {"zh-CN": "\u7701 / \u5dde / \u884c\u653f\u533a", "en": "Province / state / region"},
     "agent.province_skip": {"zh-CN": "\u5f53\u524d\u56fd\u5bb6/\u5730\u533a\u65e0\u9700\u8be5\u6b65", "en": "No province/state step for this country/region"},
     "agent.city_select": {"zh-CN": "\u57ce\u5e02", "en": "City"},
-    "agent.city_catalog_hint": {"zh-CN": "\u57ce\u5e02\u5217\u8868\u5df2\u6309\u62fc\u97f3/\u9996\u5b57\u6bcd\u6392\u5e8f\uff0c\u672a\u6536\u5f55\u6216\u8fd1\u671f\u8986\u76d6\u4e0d\u7a33\u5b9a\u7684\u5730\u70b9\u4f1a\u88ab\u9690\u85cf\u3002", "en": "City lists are sorted by pinyin/initial letter. Locations with weaker or stale recent coverage are intentionally hidden from the catalog."},
+    "agent.city_catalog_hint": {"zh-CN": "\u57ce\u5e02\u5217\u8868\u5df2\u6309\u62fc\u97f3/\u9996\u5b57\u6bcd\u6392\u5e8f\u3002\u4e2d\u56fd\u76ee\u524d\u5df2\u6269\u5c55\u5230\u5168\u90e8 31 \u4e2a\u7701\u7ea7\u884c\u653f\u533a\uff0c\u5e76\u8986\u76d6\u8d85\u8fc7 50% \u7684\u5730\u7ea7\u5e02/\u76f4\u8f96\u5e02\uff0c\u4f18\u5148\u4e00\u4e8c\u7ebf\u57ce\u5e02\uff0c\u4e0d\u5305\u542b\u53bf\u7ea7\u5e02\u3002", "en": "City lists are sorted by pinyin/initial letter. China coverage now spans all 31 mainland province-level regions and more than 50% of prefecture-level cities / municipalities, prioritizing tier-1 and tier-2 cities and excluding county-level cities."},
     "agent.support_window": {"zh-CN": "\u5f53\u524d\u9009\u62e9\uff1a`{path}` | \u6570\u636e\u6e90\uff1a{source} | \u53ef\u7528\u65f6\u95f4\u7a97\uff1a{window}", "en": "Current selection: `{path}` | Source: {source} | Availability window: {window}"},
+    "agent.deepseek_proxy_hint": {"zh-CN": "\u82e5\u542f\u7528 DeepSeek\uff0c\u5f53\u9009\u4e2d\u7684\u4e2d\u56fd\u57ce\u5e02\u5728\u5f53\u524d\u6570\u636e\u6e90\u4e0b\u65e0\u53ef\u7528\u6c61\u67d3\u7269\u503c\u65f6\uff0c\u91c7\u96c6\u5668\u4f1a\u5c1d\u8bd5\u7528\u540c\u7701\u57ce\u5e02\u4f5c\u4e3a\u53ef\u89c6\u5316\u4ee3\u7406\u6570\u636e\u3002", "en": "When DeepSeek is enabled and a selected China city has no usable pollutant values in the current source, the collector can retry with same-province proxy cities for visualization."},
     "agent.year_range": {"zh-CN": "\u67e5\u8be2\u5e74\u4efd\u8303\u56f4", "en": "Year range"},
     "agent.pollutants_select": {"zh-CN": "\u7a7a\u6c14\u8d28\u91cf\u6807\u7b7e", "en": "Air-quality tags"},
     "agent.weather_select": {"zh-CN": "\u6c14\u8c61\u6807\u7b7e\uff08\u53ef\u9009\uff09", "en": "Weather tags (optional)"},
@@ -146,6 +147,10 @@ TRANSLATIONS = {
     "collection.progress_saved": {"zh-CN": "\u6570\u636e\u96c6\u5df2\u4fdd\u5b58\u5230 {path}", "en": "Saved dataset to {path}"},
     "collection.weather_skipped": {"zh-CN": "{start} \u81f3 {end} \u7684\u6c14\u8c61\u8865\u5145\u5df2\u8df3\u8fc7\uff1a{error}", "en": "Weather supplement skipped for {start} to {end}: {error}"},
     "collection.no_rows": {"zh-CN": "\u91c7\u96c6\u5df2\u6267\u884c\u5b8c\u6210\uff0c\u4f46\u8ba1\u5212\u65f6\u95f4\u8303\u56f4\u5185\u672a\u8fd4\u56de\u4efb\u4f55\u7a7a\u6c14\u8d28\u91cf\u6570\u636e\u3002", "en": "The collection run completed, but no air-quality rows were returned for the planned range."},
+    "collection.no_usable_rows": {"zh-CN": "\u91c7\u96c6\u5df2\u8fd4\u56de\u65f6\u95f4\u6233\uff0c\u4f46\u6240\u9009\u6c61\u67d3\u7269\u5728\u8be5\u65f6\u95f4\u7a97\u5185\u5747\u65e0\u53ef\u7528\u6570\u503c\u3002", "en": "The collection returned timestamps, but none of the selected pollutants had usable values in the planned window."},
+    "collection.deepseek_proxy_attempt": {"zh-CN": "\u8bf7\u6c42\u57ce\u5e02 {requested} \u5728\u5f53\u524d\u6570\u636e\u6e90\u4e0b\u65e0\u53ef\u7528\u6c61\u67d3\u7269\u503c\uff0c\u6b63\u5728\u8bf7 DeepSeek \u63a8\u8350 {province} \u5185\u7684\u4ee3\u7406\u67e5\u8be2\u3002", "en": "Requested city {requested} had no usable pollutant coverage in the current source; asking DeepSeek for proxy queries inside {province}."},
+    "collection.deepseek_proxy_used": {"zh-CN": "\u8bf7\u6c42\u57ce\u5e02 {requested} \u8986\u76d6\u8f83\u5f31\uff0c\u56e0\u6b64\u4f7f\u7528 {actual} \u4f5c\u4e3a\u540c\u7701\u7684\u53ef\u89c6\u5316\u4ee3\u7406\u6570\u636e\u3002", "en": "Requested city {requested} had weak coverage, so {actual} was used as a same-province proxy dataset for visualization."},
+    "collection.deepseek_proxy_failed": {"zh-CN": "DeepSeek \u5df2\u63d0\u4f9b\u540c\u7701\u4ee3\u7406\u63d0\u793a\uff0c\u4f46\u672a\u627e\u5230\u4efb\u4f55\u6709\u6548\u7684\u7a7a\u6c14\u8d28\u91cf\u6570\u636e\u3002", "en": "DeepSeek suggested same-province proxy hints, but none produced usable air-quality data."},
 }
 
 

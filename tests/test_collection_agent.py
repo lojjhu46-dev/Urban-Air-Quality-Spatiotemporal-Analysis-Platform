@@ -49,6 +49,34 @@ def berlin_candidate() -> CityCandidate:
     )
 
 
+def yangjiang_candidate() -> CityCandidate:
+    return CityCandidate(
+        name="Yangjiang",
+        country="China",
+        country_code="CN",
+        latitude=21.857958,
+        longitude=111.982232,
+        timezone="Asia/Shanghai",
+        admin1="Guangdong",
+        population=2480000,
+        open_meteo_id=1787452,
+    )
+
+
+def foshan_candidate() -> CityCandidate:
+    return CityCandidate(
+        name="Foshan",
+        country="China",
+        country_code="CN",
+        latitude=23.021478,
+        longitude=113.121435,
+        timezone="Asia/Shanghai",
+        admin1="Guangdong",
+        population=7194311,
+        open_meteo_id=1811104,
+    )
+
+
 def test_resolve_supported_window_clips_non_europe_start() -> None:
     actual_start, actual_end, source_domain, sampling_step, warnings = resolve_supported_window(
         shanghai_candidate(),
@@ -246,6 +274,60 @@ def test_run_deepseek_tool_agent_completes_tool_loop(monkeypatch) -> None:
     assert "Berlin" in result.assistant_message
     assert result.state.last_plan is not None
     assert result.tool_trace[0]["tool"] == "build_collection_plan"
+
+
+def test_run_collection_agent_uses_deepseek_proxy_for_sparse_same_province_city(monkeypatch) -> None:
+    request = CollectionRequest(
+        city_query="Yangjiang",
+        start_year=2023,
+        end_year=2023,
+        pollutants=["pm25"],
+        include_weather=False,
+        country_code="CN",
+    )
+
+    def fake_fetch_air_quality_chunk(plan, chunk):  # noqa: ANN001
+        del chunk
+        timestamps = pd.date_range("2023-01-01", periods=3, freq="3h", tz="Asia/Shanghai")
+        if plan.city_label.startswith("Yangjiang"):
+            return pd.DataFrame({"timestamp": timestamps, "pm25": [pd.NA, pd.NA, pd.NA]})
+        return pd.DataFrame({"timestamp": timestamps, "pm25": [11.0, 14.0, 18.0]})
+
+    def fake_generate_proxy_city_plan(*args, **kwargs):  # noqa: ANN001
+        del args, kwargs
+        return {
+            "query_variants": [],
+            "proxy_city_names": ["Foshan"],
+            "note": "Using a nearby same-province proxy city.",
+        }
+
+    def fake_search(query: str, country_code: str | None = None, count: int = 5, language: str = "en") -> list[CityCandidate]:
+        assert query == "Foshan"
+        assert country_code == "CN"
+        assert count == 5
+        assert language == "en"
+        return [foshan_candidate()]
+
+    monkeypatch.setattr(collection_agent, "fetch_air_quality_chunk", fake_fetch_air_quality_chunk)
+    monkeypatch.setattr(collection_agent, "fetch_weather_chunk", lambda *args, **kwargs: pd.DataFrame())
+    monkeypatch.setattr(collection_agent, "_generate_proxy_city_plan", fake_generate_proxy_city_plan)
+    monkeypatch.setattr(collection_agent, "search_city_candidates", fake_search)
+    monkeypatch.setattr(collection_agent, "save_dataset", lambda df, output_path: output_path)
+    monkeypatch.setattr(collection_agent, "generate_collection_summary", lambda *args, **kwargs: ("proxy summary", "deterministic"))
+    monkeypatch.setattr(collection_agent, "_generate_planner_guidance", lambda *args, **kwargs: None)
+
+    result = collection_agent.run_collection_agent(
+        request,
+        yangjiang_candidate(),
+        api_key="sk-test",
+        language="en",
+    )
+
+    assert result.plan.city_label == "Foshan, Guangdong, China"
+    assert result.row_count == 3
+    assert result.coverage_rows[0]["non_null_ratio"] == 1.0
+    assert any("proxy dataset" in item for item in result.runtime_warnings)
+    assert result.summary_text == "proxy summary"
 
 
 
