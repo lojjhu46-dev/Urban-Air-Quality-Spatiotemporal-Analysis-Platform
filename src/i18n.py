@@ -12,6 +12,7 @@ LANGUAGE_OPTIONS = {
 
 TRANSLATIONS = {
     "language.label": {"zh-CN": "\u8bed\u8a00", "en": "Language"},
+    "nav.home": {"zh-CN": "\u9996\u9875", "en": "Home"},
     "app.page_title": {"zh-CN": "\u7a7a\u6c14\u8d28\u91cf\u5206\u6790\u5e73\u53f0", "en": "Air Quality Dashboard"},
     "app.title": {"zh-CN": "\u57ce\u5e02\u7a7a\u6c14\u8d28\u91cf\u65f6\u7a7a\u5206\u6790\u5e73\u53f0", "en": "City Air Quality Spatiotemporal Dashboard"},
     "app.caption": {"zh-CN": "Python 3.14 | Streamlit + Plotly | \u5386\u53f2\u6570\u636e\u91c7\u96c6 Agent", "en": "Python 3.14 | Streamlit + Plotly | Historical Collection Agent"},

@@ -6,6 +6,7 @@ import streamlit as st
 from src.charts import correlation_heatmap, scatter_with_regression
 from src.i18n import get_language, render_language_selector, t, weather_label
 from src.metrics import compute_correlations
+from src.navigation import render_sidebar_navigation
 from src.ui import cached_load_dataset, dataset_path_from_env, render_filters
 
 language = get_language()
@@ -13,6 +14,7 @@ st.set_page_config(page_title=t("correlation.page_title", language), layout="wid
 
 with st.sidebar:
     language = render_language_selector(key="language_selector_correlation")
+    render_sidebar_navigation(language)
 
 st.title(t("correlation.title", language))
 

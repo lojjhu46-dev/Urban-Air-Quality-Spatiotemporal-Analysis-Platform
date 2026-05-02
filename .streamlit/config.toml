@@ -4,6 +4,9 @@ address = "0.0.0.0"
 port = 8501
 maxUploadSize = 200
 
+[client]
+showSidebarNavigation = false
+
 [theme]
 base = "light"
 primaryColor = "#0B7285"

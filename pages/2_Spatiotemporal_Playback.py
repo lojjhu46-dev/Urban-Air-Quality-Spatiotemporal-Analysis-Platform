@@ -8,6 +8,7 @@ import streamlit as st
 from src.charts import map_figure
 from src.data import build_map_frame
 from src.i18n import get_language, render_language_selector, t
+from src.navigation import render_sidebar_navigation
 from src.ui import cached_load_dataset, dataset_path_from_env, render_filters
 
 language = get_language()
@@ -15,6 +16,7 @@ st.set_page_config(page_title=t("playback.page_title", language), layout="wide")
 
 with st.sidebar:
     language = render_language_selector(key="language_selector_playback")
+    render_sidebar_navigation(language)
 
 st.title(t("playback.title", language))
 

@@ -68,10 +68,24 @@ def test_build_agent_instruction_mentions_location_and_tags() -> None:
 def test_china_city_option_exposes_chinese_display_labels() -> None:
     option = city_option_from_path("Asia", "China", "Beijing Municipality", "Beijing")
 
-    assert option.display_province("zh-CN") == "北京市"
-    assert option.display_city("zh-CN") == "北京"
-    assert option.path_label_for_language("zh-CN") == "Asia - China - 北京市 - 北京"
+    assert option.display_continent("zh-CN") == "\u4e9a\u6d32"
+    assert option.display_country("zh-CN") == "\u4e2d\u56fd"
+    assert option.display_province("zh-CN") == "\u5317\u4eac\u5e02"
+    assert option.display_city("zh-CN") == "\u5317\u4eac"
+    assert option.path_label_for_language("zh-CN") == "\u4e9a\u6d32 - \u4e2d\u56fd - \u5317\u4eac\u5e02 - \u5317\u4eac"
     assert option.city_query == "Beijing"
+
+
+def test_non_china_city_option_exposes_localized_display_labels() -> None:
+    option = city_option_from_path("North America", "United States", "California", "San Francisco")
+
+    assert option.display_continent("zh-CN") == "\u5317\u7f8e\u6d32"
+    assert option.display_country("zh-CN") == "\u7f8e\u56fd"
+    assert option.display_province("zh-CN") == "\u52a0\u5229\u798f\u5c3c\u4e9a\u5dde"
+    assert option.display_city("zh-CN") == "\u65e7\u91d1\u5c71"
+    assert option.path_label_for_language("zh-CN") == "\u5317\u7f8e\u6d32 - \u7f8e\u56fd - \u52a0\u5229\u798f\u5c3c\u4e9a\u5dde - \u65e7\u91d1\u5c71"
+    assert option.path_label_for_language("en") == "North America - United States - California - San Francisco"
+    assert option.city_query == "San Francisco"
 
 
 def test_build_city_search_queries_include_region_and_country() -> None:

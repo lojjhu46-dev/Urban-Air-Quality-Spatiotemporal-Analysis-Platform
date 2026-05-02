@@ -10,20 +10,24 @@ from src.agent_interaction import (
     build_agent_instruction,
     build_city_search_queries,
     candidate_matches_city_option,
+    city_display_name,
     city_labels,
     city_option_from_path,
+    continent_display_name,
     continent_labels,
+    country_display_name,
     country_labels,
     default_city_option,
     option_has_province_step,
+    province_display_name,
     province_labels,
 )
 from src.charts import trend_figure
-from src.china_city_catalog import china_city_display_name, china_province_display_name
 from src.collection_agent import CollectionRequest, build_collection_plan, collection_plan_from_dict, run_collection_agent, search_city_candidates
 from src.config import AQ_AGENT_DEFAULT_MODEL, AQ_AGENT_POLLUTANTS, DEEPSEEK_BASE_URL
 from src.data import load_dataset
 from src.i18n import get_language, render_language_selector, t, weather_label
+from src.navigation import render_sidebar_navigation
 from src.ui import DATASET_OVERRIDE_KEY, PENDING_DATASET_CHOICE_KEY, dataset_path_from_env, render_dataframe
 
 language = get_language()
@@ -31,6 +35,7 @@ st.set_page_config(page_title=t("agent.page_title", language), layout="wide")
 
 with st.sidebar:
     language = render_language_selector(key="language_selector_agent")
+    render_sidebar_navigation(language)
 
 dataset_path_from_env()
 
@@ -152,15 +157,33 @@ def _current_instruction() -> str:
 
 
 def _format_province_option(province: str) -> str:
-    if st.session_state.get(COUNTRY_KEY) == "China":
-        return china_province_display_name(province, language) or province
-    return province
+    return (
+        province_display_name(
+            st.session_state.get(CONTINENT_KEY) or "",
+            st.session_state.get(COUNTRY_KEY) or "",
+            province,
+            language,
+        )
+        or province
+    )
 
 
 def _format_city_option(city: str) -> str:
-    if st.session_state.get(COUNTRY_KEY) == "China":
-        return china_city_display_name(st.session_state.get(PROVINCE_KEY) or None, city, language)
-    return city
+    return city_display_name(
+        st.session_state.get(CONTINENT_KEY) or "",
+        st.session_state.get(COUNTRY_KEY) or "",
+        st.session_state.get(PROVINCE_KEY) or None,
+        city,
+        language,
+    )
+
+
+def _format_continent_option(continent: str) -> str:
+    return continent_display_name(continent, language)
+
+
+def _format_country_option(country: str) -> str:
+    return country_display_name(st.session_state.get(CONTINENT_KEY) or "", country, language)
 
 
 def _resolve_selected_candidate() -> object:
@@ -284,9 +307,19 @@ st.caption(t("agent.request_caption", language))
 
 row1_left, row1_right = st.columns((1, 1))
 with row1_left:
-    st.selectbox(t("agent.continent_select", language), options=continent_options, key=CONTINENT_KEY)
+    st.selectbox(
+        t("agent.continent_select", language),
+        options=continent_options,
+        format_func=_format_continent_option,
+        key=CONTINENT_KEY,
+    )
 with row1_right:
-    st.selectbox(t("agent.country_select", language), options=country_options, key=COUNTRY_KEY)
+    st.selectbox(
+        t("agent.country_select", language),
+        options=country_options,
+        format_func=_format_country_option,
+        key=COUNTRY_KEY,
+    )
 
 row2_left, row2_right = st.columns((1, 1))
 with row2_left:

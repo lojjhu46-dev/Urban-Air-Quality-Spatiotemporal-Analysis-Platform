@@ -5,6 +5,7 @@ import streamlit as st
 from src.charts import ranking_figure, trend_figure
 from src.i18n import get_language, render_language_selector, t
 from src.metrics import compute_metrics, compute_station_ranking, detect_events
+from src.navigation import render_sidebar_navigation
 from src.ui import cached_load_dataset, dataset_path_from_env, render_dataframe, render_filters
 
 language = get_language()
@@ -12,6 +13,7 @@ st.set_page_config(page_title=t("overview.page_title", language), layout="wide")
 
 with st.sidebar:
     language = render_language_selector(key="language_selector_overview")
+    render_sidebar_navigation(language)
 
 st.title(t("overview.title", language))
 

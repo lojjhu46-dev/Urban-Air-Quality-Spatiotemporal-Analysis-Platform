@@ -3,10 +3,14 @@ from __future__ import annotations
 import streamlit as st
 
 from src.i18n import get_language, render_language_selector, t
+from src.navigation import render_sidebar_navigation
 from src.ui import dataset_path_from_env
 
 language = get_language()
 st.set_page_config(page_title=t("app.page_title", language), layout="wide")
+
+with st.sidebar:
+    render_sidebar_navigation(language)
 
 active_dataset_path = dataset_path_from_env()
 

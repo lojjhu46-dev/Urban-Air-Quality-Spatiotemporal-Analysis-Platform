@@ -3,12 +3,13 @@ from __future__ import annotations
 import unicodedata
 from dataclasses import dataclass
 
-from src.china_city_catalog import (
-    MAINLAND_CHINA_CITY_ROWS,
-    TOTAL_PRC_PREFECTURE_LEVEL_CITIES,
-    china_city_display_name,
-    china_province_display_name,
+from src.catalog_display import (
+    city_display_name,
+    continent_display_name,
+    country_display_name,
+    province_display_name,
 )
+from src.china_city_catalog import MAINLAND_CHINA_CITY_ROWS, TOTAL_PRC_PREFECTURE_LEVEL_CITIES
 from src.config import EUROPE_COUNTRY_CODES
 
 
@@ -36,18 +37,20 @@ class AgentCityOption:
     def path_label(self) -> str:
         return self.path_label_for_language()
 
+    def display_continent(self, language: str = "en") -> str:
+        return continent_display_name(self.continent, language)
+
+    def display_country(self, language: str = "en") -> str:
+        return country_display_name(self.continent, self.country, language)
+
     def display_province(self, language: str = "en") -> str | None:
-        if self.country_code.upper() == "CN":
-            return china_province_display_name(self.province, language)
-        return self.province
+        return province_display_name(self.continent, self.country, self.province, language)
 
     def display_city(self, language: str = "en") -> str:
-        if self.country_code.upper() == "CN":
-            return china_city_display_name(self.province, self.city, language)
-        return self.city
+        return city_display_name(self.continent, self.country, self.province, self.city, language)
 
     def path_label_for_language(self, language: str = "en") -> str:
-        parts = [self.continent, self.country]
+        parts = [self.display_continent(language), self.display_country(language)]
         province = self.display_province(language)
         if province:
             parts.append(province)
