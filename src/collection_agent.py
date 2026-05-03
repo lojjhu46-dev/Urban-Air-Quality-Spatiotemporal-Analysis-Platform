@@ -200,7 +200,7 @@ def custom_city_validation_from_dict(data: dict[str, Any]) -> CustomCityValidati
     return CustomCityValidationResult(
         input_country=str(data.get("input_country") or ""),
         input_city=str(data.get("input_city") or ""),
-        status=str(data.get("status") or "low_confidence"),
+        status=_normalize_custom_city_status(data.get("status"), data.get("message")),
         corrected_country=str(data.get("corrected_country") or "") or None,
         corrected_city=str(data.get("corrected_city") or "") or None,
         country_code=_normalize_country_code(data.get("country_code")),
@@ -256,10 +256,6 @@ def validate_custom_city_with_deepseek(
     if not data:
         raise ValueError(t("agent.custom_city_validation_unavailable", language))
 
-    status = str(data.get("status") or "").strip().lower()
-    if status not in {"valid", "needs_confirmation", "low_confidence"}:
-        status = "low_confidence"
-
     corrected_country = str(data.get("corrected_country") or "").strip() or None
     corrected_city = str(data.get("corrected_city") or "").strip() or None
     country_code = _normalize_country_code(data.get("country_code"))
@@ -269,8 +265,13 @@ def validate_custom_city_with_deepseek(
     message = str(data.get("message") or "").strip()
     if not message:
         message = t("agent.custom_city_validated", language, city=corrected_city or clean_city, country=corrected_country or clean_country)
+    status = _normalize_custom_city_status(data.get("status"), message)
 
-    if status == "valid" and (not corrected_city or not corrected_country or not country_code):
+    if status == "valid":
+        corrected_country = corrected_country or clean_country
+        corrected_city = corrected_city or clean_city
+
+    if status == "valid" and (not corrected_city or not corrected_country):
         status = "needs_confirmation" if matching_countries else "low_confidence"
     if status == "valid":
         country_changed = corrected_country and _normalize_location_key(corrected_country) != _normalize_location_key(clean_country)
@@ -1746,6 +1747,38 @@ def _unique_strings(values: list[str]) -> list[str]:
         output.append(text)
         seen.add(text)
     return output
+
+
+def _normalize_custom_city_status(raw_status: Any, message: Any = None) -> str:
+    text = f"{raw_status or ''} {message or ''}".strip().lower()
+    compact = re.sub(r"[\s_\-]+", "", text)
+    if not compact:
+        return "low_confidence"
+    if compact in {"valid", "needsconfirmation", "lowconfidence"}:
+        return {"valid": "valid", "needsconfirmation": "needs_confirmation", "lowconfidence": "low_confidence"}[compact]
+    if any(token in text for token in ("low confidence", "invalid", "not valid")) or any(
+        token in compact for token in ("\u4f4e\u7f6e\u4fe1", "\u7f6e\u4fe1\u5ea6\u4f4e", "\u65e0\u6548", "\u4e0d\u786e\u5b9a", "\u4e0d\u5339\u914d")
+    ):
+        return "low_confidence"
+    if any(
+        token in compact
+        for token in (
+            "needsconfirmation",
+            "requiresconfirmation",
+            "confirmationrequired",
+            "pleaseconfirm",
+            "confirmcountry",
+            "ambiguous",
+            "\u9700\u786e\u8ba4",
+            "\u9700\u8981\u786e\u8ba4",
+            "\u91cd\u540d",
+            "\u591a\u4e2a",
+        )
+    ):
+        return "needs_confirmation"
+    if any(token in compact for token in ("valid", "correct", "\u6709\u6548", "\u6b63\u786e", "\u9a8c\u8bc1\u6210\u529f")):
+        return "valid"
+    return "low_confidence"
 
 
 def _normalize_country_code(value: Any) -> str | None:

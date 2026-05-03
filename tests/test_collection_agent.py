@@ -371,6 +371,56 @@ def test_validate_custom_city_with_deepseek_returns_valid_result(monkeypatch) ->
     assert "Return JSON only" in str(captured_messages[0]["content"])
 
 
+def test_validate_custom_city_with_deepseek_normalizes_chinese_valid_status(monkeypatch) -> None:
+    def fake_json_completion(*args, **kwargs):  # noqa: ANN001
+        del args, kwargs
+        return {
+            "status": "\u4f4d\u7f6e\u6709\u6548",
+            "corrected_country": "\u4e2d\u56fd",
+            "corrected_city": "\u6d4e\u5b81",
+            "country_code": "CN",
+            "matching_countries": ["\u4e2d\u56fd"],
+            "message": "\u4f4d\u7f6e\u6709\u6548\uff0c\u6d4e\u5b81\u662f\u4e2d\u56fd\u5c71\u4e1c\u7701\u7684\u4e00\u4e2a\u5730\u7ea7\u5e02\u3002",
+        }
+
+    monkeypatch.setattr(collection_agent, "_deepseek_json_completion", fake_json_completion)
+
+    result = validate_custom_city_with_deepseek(
+        "\u4e2d\u56fd",
+        "\u6d4e\u5b81",
+        api_key="sk-test",
+        language="zh-CN",
+    )
+
+    assert result.status == "valid"
+    assert result.corrected_country == "\u4e2d\u56fd"
+    assert result.corrected_city == "\u6d4e\u5b81"
+    assert result.country_code == "CN"
+
+
+def test_validate_custom_city_with_deepseek_keeps_valid_status_when_success_message_lacks_fields(monkeypatch) -> None:
+    def fake_json_completion(*args, **kwargs):  # noqa: ANN001
+        del args, kwargs
+        return {
+            "status": "\u4f4d\u7f6e\u9a8c\u8bc1\u6210\u529f\u3002",
+            "message": "\u4f4d\u7f6e\u9a8c\u8bc1\u6210\u529f\u3002",
+        }
+
+    monkeypatch.setattr(collection_agent, "_deepseek_json_completion", fake_json_completion)
+
+    result = validate_custom_city_with_deepseek(
+        "\u4e2d\u56fd",
+        "\u6d4e\u5b81",
+        api_key="sk-test",
+        language="zh-CN",
+    )
+
+    assert result.status == "valid"
+    assert result.corrected_country == "\u4e2d\u56fd"
+    assert result.corrected_city == "\u6d4e\u5b81"
+    assert result.country_code is None
+
+
 def test_validate_custom_city_with_deepseek_preserves_ambiguous_matches(monkeypatch) -> None:
     def fake_json_completion(*args, **kwargs):  # noqa: ANN001
         del args, kwargs

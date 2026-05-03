@@ -27,6 +27,9 @@ def test_custom_city_agent_labels_are_bilingual() -> None:
     assert t("agent.custom_city_name", "en") == "City name"
     assert "\u6b63\u5728\u542f\u52a8 Agent" in t("agent.custom_city_validated_starting_agent", "zh-CN")
     assert "did not continue with planning or collection tools" in t("agent.tool_no_progress_after_validation", "en")
+    assert "Task status storage" in t("agent.task_store_backend", "en", backend="Supabase Postgres")
+    assert "\u672c\u5730\u5185\u5b58" in t("agent.task_store_memory", "zh-CN")
+    assert "Collection plan is ready" in t("agent.task_plan_ready", "en")
 
 
 def test_weather_label_uses_translation_keys() -> None:
