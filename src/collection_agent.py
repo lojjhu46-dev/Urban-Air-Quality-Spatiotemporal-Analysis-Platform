@@ -173,12 +173,121 @@ class ToolCallingAgentResult:
     state: ToolCallingAgentState
 
 
+@dataclass(slots=True)
+class CustomCityValidationResult:
+    input_country: str
+    input_city: str
+    status: str
+    corrected_country: str | None
+    corrected_city: str | None
+    country_code: str | None
+    matching_countries: list[str]
+    message: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def city_candidate_from_dict(data: dict[str, Any]) -> CityCandidate:
     return CityCandidate(**data)
 
 
 def collection_plan_from_dict(data: dict[str, Any]) -> CollectionPlan:
     return CollectionPlan(**data)
+
+
+def custom_city_validation_from_dict(data: dict[str, Any]) -> CustomCityValidationResult:
+    return CustomCityValidationResult(
+        input_country=str(data.get("input_country") or ""),
+        input_city=str(data.get("input_city") or ""),
+        status=str(data.get("status") or "low_confidence"),
+        corrected_country=str(data.get("corrected_country") or "") or None,
+        corrected_city=str(data.get("corrected_city") or "") or None,
+        country_code=_normalize_country_code(data.get("country_code")),
+        matching_countries=[str(item) for item in list(data.get("matching_countries") or []) if str(item).strip()],
+        message=str(data.get("message") or ""),
+    )
+
+
+def validate_custom_city_with_deepseek(
+    country_or_region: str,
+    city_name: str,
+    *,
+    api_key: str,
+    model: str = AQ_AGENT_DEFAULT_MODEL,
+    base_url: str = DEEPSEEK_BASE_URL,
+    language: str = "en",
+) -> CustomCityValidationResult:
+    clean_country = country_or_region.strip()
+    clean_city = city_name.strip()
+    if not clean_country or not clean_city:
+        raise ValueError(t("agent.custom_city_inputs_required", language))
+    if not str(api_key).strip():
+        raise ValueError(t("agent.custom_city_requires_key", language))
+
+    reply_language = "Simplified Chinese" if language == "zh-CN" else "English"
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You validate user-entered global city searches for an air-quality collection agent. "
+                "Return JSON only with keys status, corrected_country, corrected_city, country_code, "
+                "matching_countries, message. "
+                "status must be one of valid, needs_confirmation, low_confidence. "
+                "Use ISO-3166 alpha-2 country_code when one country/region is likely. "
+                "If the city name exists in multiple countries, list all plausible countries in matching_countries "
+                "and set status to needs_confirmation. "
+                "If spelling is close, fill corrected_country/corrected_city and set status to needs_confirmation. "
+                "If confidence is low, set status to low_confidence and leave country_code empty. "
+                f"Write message in {reply_language}."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Validate this requested location before data collection.\n"
+                f"Country/region input: {clean_country}\n"
+                f"City input: {clean_city}\n"
+                "Do not collect data. Only validate the location and return the JSON object."
+            ),
+        },
+    ]
+    data = _deepseek_json_completion(messages, api_key=api_key, model=model, base_url=base_url, timeout=90)
+    if not data:
+        raise ValueError(t("agent.custom_city_validation_unavailable", language))
+
+    status = str(data.get("status") or "").strip().lower()
+    if status not in {"valid", "needs_confirmation", "low_confidence"}:
+        status = "low_confidence"
+
+    corrected_country = str(data.get("corrected_country") or "").strip() or None
+    corrected_city = str(data.get("corrected_city") or "").strip() or None
+    country_code = _normalize_country_code(data.get("country_code"))
+    matching_countries = _unique_strings(
+        [str(item).strip() for item in list(data.get("matching_countries") or []) if str(item).strip()]
+    )
+    message = str(data.get("message") or "").strip()
+    if not message:
+        message = t("agent.custom_city_validated", language, city=corrected_city or clean_city, country=corrected_country or clean_country)
+
+    if status == "valid" and (not corrected_city or not corrected_country or not country_code):
+        status = "needs_confirmation" if matching_countries else "low_confidence"
+    if status == "valid":
+        country_changed = corrected_country and _normalize_location_key(corrected_country) != _normalize_location_key(clean_country)
+        city_changed = corrected_city and _normalize_location_key(corrected_city) != _normalize_location_key(clean_city)
+        if country_changed or city_changed or len(matching_countries) > 1:
+            status = "needs_confirmation"
+
+    return CustomCityValidationResult(
+        input_country=clean_country,
+        input_city=clean_city,
+        status=status,
+        corrected_country=corrected_country,
+        corrected_city=corrected_city,
+        country_code=country_code,
+        matching_countries=matching_countries,
+        message=message,
+    )
 
 
 def search_city_candidates(
@@ -416,6 +525,60 @@ def execute_collection_agent_tool(
     raise ValueError(f"Unsupported agent tool: {name}")
 
 
+def _default_request_tool_arguments(default_request: CollectionRequest) -> dict[str, Any]:
+    return {
+        "city_query": default_request.city_query,
+        "country_code": default_request.country_code,
+        "start_year": default_request.start_year,
+        "end_year": default_request.end_year,
+        "pollutants": default_request.normalized_pollutants(),
+        "include_weather": default_request.include_weather,
+        "weather_fields": default_request.normalized_weather_fields(),
+        "candidate_index": 0,
+    }
+
+
+def _execute_default_request_tool_flow(
+    default_request: CollectionRequest,
+    *,
+    allow_run_collection: bool,
+    state: ToolCallingAgentState,
+    tool_trace: list[dict[str, Any]],
+    progress_callback: ProgressCallback | None,
+    output_dir: Path,
+    search_language: str,
+    language: str,
+) -> None:
+    search_arguments = {
+        "query": default_request.city_query,
+        "country_code": default_request.country_code,
+        "count": 5,
+    }
+    search_output = execute_collection_agent_tool(
+        "search_city_candidates",
+        search_arguments,
+        state=state,
+        progress_callback=progress_callback,
+        output_dir=output_dir,
+        search_language=search_language,
+        language=language,
+    )
+    tool_trace.append({"tool": "search_city_candidates", "arguments": search_arguments, "result": search_output})
+
+    tool_name = "run_collection" if allow_run_collection else "build_collection_plan"
+    tool_arguments = _default_request_tool_arguments(default_request)
+    tool_output = execute_collection_agent_tool(
+        tool_name,
+        tool_arguments,
+        state=state,
+        progress_callback=progress_callback,
+        output_dir=output_dir,
+        search_language=search_language,
+        language=language,
+    )
+    tool_trace.append({"tool": tool_name, "arguments": tool_arguments, "result": tool_output})
+
+
 def run_deepseek_tool_agent(
     user_prompt: str,
     *,
@@ -470,7 +633,21 @@ def run_deepseek_tool_agent(
 
         tool_calls = assistant_message.get("tool_calls") or []
         if not tool_calls:
-            final_message = last_assistant_content or _fallback_agent_reply(state, allow_run_collection, language=language)
+            if default_request is not None and (
+                (allow_run_collection and state.last_result is None)
+                or (not allow_run_collection and state.last_plan is None)
+            ):
+                _execute_default_request_tool_flow(
+                    default_request,
+                    allow_run_collection=allow_run_collection,
+                    state=state,
+                    tool_trace=tool_trace,
+                    progress_callback=progress_callback,
+                    output_dir=output_dir,
+                    search_language=search_language,
+                    language=language,
+                )
+            final_message = _fallback_agent_reply(state, allow_run_collection, language=language) or last_assistant_content
             return ToolCallingAgentResult(assistant_message=final_message, tool_trace=tool_trace, state=state)
 
         for tool_call in tool_calls:
@@ -500,7 +677,21 @@ def run_deepseek_tool_agent(
                 }
             )
 
-    final_message = last_assistant_content or _fallback_agent_reply(state, allow_run_collection, language=language)
+    if default_request is not None and (
+        (allow_run_collection and state.last_result is None)
+        or (not allow_run_collection and state.last_plan is None)
+    ):
+        _execute_default_request_tool_flow(
+            default_request,
+            allow_run_collection=allow_run_collection,
+            state=state,
+            tool_trace=tool_trace,
+            progress_callback=progress_callback,
+            output_dir=output_dir,
+            search_language=search_language,
+            language=language,
+        )
+    final_message = _fallback_agent_reply(state, allow_run_collection, language=language) or last_assistant_content
     return ToolCallingAgentResult(assistant_message=final_message, tool_trace=tool_trace, state=state)
 
 

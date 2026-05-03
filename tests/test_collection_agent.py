@@ -8,6 +8,7 @@ import src.collection_agent as collection_agent
 from src.collection_agent import (
     CityCandidate,
     CollectionRequest,
+    CollectionResult,
     ToolCallingAgentState,
     _normalize_local_times,
     build_collection_plan,
@@ -18,6 +19,7 @@ from src.collection_agent import (
     resolve_supported_window,
     run_deepseek_tool_agent,
     summarize_dataset_coverage,
+    validate_custom_city_with_deepseek,
 )
 
 
@@ -274,6 +276,153 @@ def test_run_deepseek_tool_agent_completes_tool_loop(monkeypatch) -> None:
     assert "Berlin" in result.assistant_message
     assert result.state.last_plan is not None
     assert result.tool_trace[0]["tool"] == "build_collection_plan"
+
+
+def test_run_deepseek_tool_agent_uses_default_collection_when_model_returns_no_tools(monkeypatch) -> None:
+    calls: dict[str, object] = {}
+
+    def fake_chat_completion(*args, **kwargs):  # noqa: ANN001
+        del args
+        calls["tool_choice"] = kwargs["tool_choice"]
+        return {"choices": [{"message": {"role": "assistant", "content": "\u4f4d\u7f6e\u9a8c\u8bc1\u6210\u529f"}}]}
+
+    def fake_search(query: str, country_code: str | None = None, count: int = 5, language: str = "en") -> list[CityCandidate]:
+        calls["search"] = (query, country_code, count, language)
+        return [berlin_candidate()]
+
+    def fake_run_collection_agent(
+        request: CollectionRequest,
+        candidate: CityCandidate,
+        **kwargs,  # noqa: ANN003
+    ) -> CollectionResult:
+        calls["collection"] = (request, candidate, kwargs["language"])
+        plan = build_collection_plan(request, candidate, api_key=None, output_dir=kwargs["output_dir"], language=kwargs["language"])
+        frame = pd.DataFrame({"timestamp": ["2024-01-01 00:00:00"], "pm25": [12.0]})
+        return CollectionResult(
+            plan=plan,
+            dataset=frame,
+            output_path=plan.output_path,
+            row_count=1,
+            started_at="2024-01-01 00:00:00",
+            ended_at="2024-01-01 00:00:00",
+            coverage_rows=[{"pollutant": "pm25", "non_null_ratio": 1.0}],
+            runtime_warnings=[],
+            summary_text="Saved Berlin dataset.",
+            summary_mode="deterministic",
+        )
+
+    monkeypatch.setattr(collection_agent, "_deepseek_chat_completion", fake_chat_completion)
+    monkeypatch.setattr(collection_agent, "search_city_candidates", fake_search)
+    monkeypatch.setattr(collection_agent, "run_collection_agent", fake_run_collection_agent)
+
+    request = CollectionRequest(
+        city_query="Berlin",
+        start_year=2024,
+        end_year=2024,
+        pollutants=["pm25"],
+        include_weather=False,
+        country_code="DE",
+    )
+
+    result = run_deepseek_tool_agent(
+        "\u4f4d\u7f6e\u9a8c\u8bc1\u6210\u529f",
+        api_key="sk-test",
+        default_request=request,
+        allow_run_collection=True,
+    )
+
+    assert calls["tool_choice"] == "auto"
+    assert calls["search"] == ("Berlin", "DE", 5, "en")
+    assert calls["collection"][0].city_query == "Berlin"
+    assert result.state.last_result is not None
+    assert result.assistant_message == "Saved Berlin dataset."
+    assert [item["tool"] for item in result.tool_trace] == ["search_city_candidates", "run_collection"]
+
+
+def test_validate_custom_city_with_deepseek_returns_valid_result(monkeypatch) -> None:
+    captured_messages: list[dict[str, object]] = []
+
+    def fake_json_completion(messages, **kwargs):  # noqa: ANN001
+        captured_messages.extend(messages)
+        assert kwargs["api_key"] == "sk-test"
+        return {
+            "status": "valid",
+            "corrected_country": "Japan",
+            "corrected_city": "Tokyo",
+            "country_code": "JP",
+            "matching_countries": ["Japan"],
+            "message": "Tokyo, Japan is valid.",
+        }
+
+    monkeypatch.setattr(collection_agent, "_deepseek_json_completion", fake_json_completion)
+
+    result = validate_custom_city_with_deepseek(
+        "Japan",
+        "Tokyo",
+        api_key="sk-test",
+        language="en",
+    )
+
+    assert result.status == "valid"
+    assert result.corrected_country == "Japan"
+    assert result.corrected_city == "Tokyo"
+    assert result.country_code == "JP"
+    assert result.matching_countries == ["Japan"]
+    assert "Return JSON only" in str(captured_messages[0]["content"])
+
+
+def test_validate_custom_city_with_deepseek_preserves_ambiguous_matches(monkeypatch) -> None:
+    def fake_json_completion(*args, **kwargs):  # noqa: ANN001
+        del args, kwargs
+        return {
+            "status": "needs_confirmation",
+            "corrected_country": "",
+            "corrected_city": "Springfield",
+            "country_code": "",
+            "matching_countries": ["United States", "Canada", "Australia"],
+            "message": "Springfield exists in multiple countries. Confirm the country/region.",
+        }
+
+    monkeypatch.setattr(collection_agent, "_deepseek_json_completion", fake_json_completion)
+
+    result = validate_custom_city_with_deepseek(
+        "United Stats",
+        "Springfield",
+        api_key="sk-test",
+        language="en",
+    )
+
+    assert result.status == "needs_confirmation"
+    assert result.corrected_city == "Springfield"
+    assert result.country_code is None
+    assert result.matching_countries == ["United States", "Canada", "Australia"]
+    assert "Confirm" in result.message
+
+
+def test_validate_custom_city_with_deepseek_prompts_when_spelling_is_corrected(monkeypatch) -> None:
+    def fake_json_completion(*args, **kwargs):  # noqa: ANN001
+        del args, kwargs
+        return {
+            "status": "valid",
+            "corrected_country": "Japan",
+            "corrected_city": "Tokyo",
+            "country_code": "JP",
+            "matching_countries": ["Japan"],
+            "message": "Did you mean Tokyo, Japan?",
+        }
+
+    monkeypatch.setattr(collection_agent, "_deepseek_json_completion", fake_json_completion)
+
+    result = validate_custom_city_with_deepseek(
+        "Japen",
+        "Tokio",
+        api_key="sk-test",
+        language="en",
+    )
+
+    assert result.status == "needs_confirmation"
+    assert result.corrected_country == "Japan"
+    assert result.corrected_city == "Tokyo"
 
 
 def test_run_collection_agent_uses_deepseek_proxy_for_sparse_same_province_city(monkeypatch) -> None:
