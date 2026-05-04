@@ -70,6 +70,49 @@ def _tokyo_plan(request, candidate) -> CollectionPlan:  # noqa: ANN001
     )
 
 
+def _kyoto_candidate() -> CityCandidate:
+    return CityCandidate(
+        name="Kyoto",
+        country="Japan",
+        country_code="JP",
+        latitude=35.0116,
+        longitude=135.7681,
+        timezone="Asia/Tokyo",
+        admin1="Kyoto",
+        population=1460000,
+        open_meteo_id=1857910,
+    )
+
+
+def _kyoto_plan(request, candidate) -> CollectionPlan:  # noqa: ANN001
+    return CollectionPlan(
+        city_label="Kyoto, Kyoto, Japan",
+        city_query=request.city_query,
+        country_code=request.country_code or candidate.country_code,
+        latitude=candidate.latitude,
+        longitude=candidate.longitude,
+        timezone=candidate.timezone,
+        source_name="Open-Meteo Air Quality Archive",
+        source_domain="auto",
+        sampling_step="3-hourly",
+        requested_start_date="2024-01-01",
+        requested_end_date="2026-12-31",
+        actual_start_date="2024-01-01",
+        actual_end_date="2026-05-03",
+        pollutants=["pm25"],
+        pollutant_variables=["pm2_5"],
+        weather_variables=[],
+        chunks=[{"start_date": "2024-01-01", "end_date": "2024-01-31"}],
+        output_path="data/processed/agent_runs/kyoto_2024_2026_aq.parquet",
+        warnings=[],
+        planner_mode="deterministic",
+        planner_model=None,
+        planner_notes="Stable catalog alias plan.",
+        quality_checks=[],
+        risk_flags=[],
+    )
+
+
 def test_run_custom_city_task_collects_and_writes_status_chain(monkeypatch) -> None:
     store = InMemoryAgentTaskStore()
     task = store.create_task(kind="custom_city_collection", request_payload=_custom_payload("collect"))
@@ -175,6 +218,56 @@ def test_run_custom_city_task_uses_confirmed_validation_without_revalidating(mon
     assert [log.phase for log in logs] == ["VALIDATING", "RESOLVING", "PLANNING"]
 
 
+def test_run_custom_city_task_uses_stable_catalog_alias_when_validated_name_has_no_candidates(monkeypatch) -> None:
+    store = InMemoryAgentTaskStore()
+    payload = _custom_payload("plan")
+    payload["input_city"] = "\u4eac\u90fd"
+    payload["city_query"] = "\u4eac\u90fd"
+    task = store.create_task(kind="custom_city_collection", request_payload=payload)
+    search_calls: list[tuple[str, str | None, int, str]] = []
+
+    def fake_validate(country_or_region: str, city_name: str, **kwargs):  # noqa: ANN001
+        del kwargs
+        return CustomCityValidationResult(
+            input_country=country_or_region,
+            input_city=city_name,
+            status="valid",
+            corrected_country="Japan",
+            corrected_city="\u4eac\u90fd",
+            country_code="JP",
+            matching_countries=["Japan"],
+            message="\u4f4d\u7f6e\u6709\u6548\uff0c\u4eac\u90fd\u4f4d\u4e8e\u65e5\u672c\u3002",
+        )
+
+    def fake_search(query: str, country_code: str | None = None, count: int = 5, language: str = "en") -> list[CityCandidate]:
+        search_calls.append((query, country_code, count, language))
+        if query == "Kyoto":
+            return [_kyoto_candidate()]
+        return []
+
+    def fake_build_plan(request, candidate, **kwargs):  # noqa: ANN001
+        del kwargs
+        return _kyoto_plan(request, candidate)
+
+    monkeypatch.setattr(collection_agent, "validate_custom_city_with_deepseek", fake_validate)
+    monkeypatch.setattr(collection_agent, "search_city_candidates", fake_search)
+    monkeypatch.setattr(collection_agent, "build_collection_plan", fake_build_plan)
+
+    run_custom_city_task(
+        store,
+        task.task_id,
+        AgentTaskRunConfig(api_key="sk-test", model="deepseek-chat", base_url="https://api.deepseek.com", language="zh-CN"),
+    )
+
+    updated = store.get_task(task.task_id)
+
+    assert updated is not None
+    assert updated.status == AgentTaskStatus.PLANNED
+    assert updated.result_payload["city_query"] == "Kyoto"
+    assert search_calls[0] == ("\u4eac\u90fd", "JP", 10, "zh")
+    assert ("Kyoto", "JP", 10, "zh") in search_calls
+
+
 def test_start_background_custom_city_task_returns_before_runner_finishes(monkeypatch) -> None:
     store = InMemoryAgentTaskStore()
     task = store.create_task(kind="custom_city_collection", request_payload=_custom_payload("collect"))
@@ -203,3 +296,31 @@ def test_start_background_custom_city_task_returns_before_runner_finishes(monkey
     release.set()
     thread.join(timeout=2)
     assert store.get_task(task.task_id).status == AgentTaskStatus.SAVED
+
+
+def test_runner_does_not_overwrite_watchdog_timeout(monkeypatch) -> None:
+    store = InMemoryAgentTaskStore()
+    task = store.create_task(kind="custom_city_collection", request_payload=_custom_payload("plan"))
+    store.update_task(
+        task.task_id,
+        status=AgentTaskStatus.TIMEOUT,
+        phase="TIMEOUT",
+        progress=1.0,
+        message="Timed out by watchdog",
+        error="Timed out by watchdog",
+    )
+
+    agent_task_runner._record_step(
+        store,
+        task.task_id,
+        status=AgentTaskStatus.PLANNED,
+        phase="PLANNING",
+        progress=1.0,
+        message="Late plan",
+        result_payload={"city_label": "Tokyo, Japan"},
+    )
+
+    updated = store.get_task(task.task_id)
+    assert updated is not None
+    assert updated.status == AgentTaskStatus.TIMEOUT
+    assert updated.result_payload == {}

@@ -30,6 +30,8 @@ AQ_AGENT_POLLUTANTS = {
 
 AQ_AGENT_DEFAULT_MODEL = "deepseek-v4-flash"
 AQ_AGENT_CHUNK_DAYS = 90
+AQ_AGENT_TASK_TIMEOUT_SECONDS = 1800
+AQ_AGENT_TASK_STALLED_SECONDS = 300
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 OPEN_METEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"

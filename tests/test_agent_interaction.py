@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 import time
 
 import pandas as pd
@@ -7,9 +8,11 @@ from streamlit.testing.v1 import AppTest
 
 import src.agent_task_store as agent_task_store
 import src.collection_agent as collection_agent
+from src.ui import DATASET_CHOICE_KEY, DATASET_OVERRIDE_KEY, PENDING_DATASET_CHOICE_KEY
 from src.agent_task_store import AgentTaskStatus, InMemoryAgentTaskStore
 from src.agent_interaction import (
     DEFAULT_CITY_PATH,
+    all_city_options,
     build_agent_instruction,
     build_city_search_queries,
     candidate_matches_city_option,
@@ -18,7 +21,6 @@ from src.agent_interaction import (
     china_province_city_names,
     city_labels,
     city_option_from_path,
-    continent_labels,
     country_labels,
     default_city_option,
     option_has_province_step,
@@ -150,23 +152,50 @@ def test_catalog_marks_province_step_only_when_needed() -> None:
     assert not option_has_province_step("Asia", "Singapore")
 
 
-def test_agent_page_renders_structured_selectors() -> None:
+def test_all_city_options_preserves_original_stable_candidates() -> None:
+    stable_paths = {
+        (option.continent, option.country, option.province, option.city)
+        for option in all_city_options()
+    }
+
+    assert ("Asia", "Japan", "Kyoto", "Kyoto") in stable_paths
+    assert ("Asia", "Japan", "Hokkaido", "Sapporo") in stable_paths
+    assert ("Asia", "Japan", "Tokyo", "Tokyo") in stable_paths
+    assert DEFAULT_CITY_PATH in stable_paths
+
+
+def test_agent_page_renders_custom_city_form_only() -> None:
     at = AppTest.from_file("pages/4_Historical_Data_Agent.py")
     at.run()
 
-    labels = [widget.label for widget in at.selectbox]
-    assert "Continent" in labels
-    assert "Country / region" in labels
-    assert "City" in labels
+    selectbox_labels = [widget.label for widget in at.selectbox]
+    text_input_labels = [widget.label for widget in at.text_input]
+
+    assert "Continent" not in selectbox_labels
+    assert "Province / state / region" not in selectbox_labels
+    assert "City" not in selectbox_labels
+    assert "Stable city candidate (optional)" in selectbox_labels
+    assert "Country / region" in text_input_labels
+    assert "City name" in text_input_labels
     assert len(at.multiselect) >= 2
-    continent_widget = next(widget for widget in at.selectbox if widget.label == "Continent")
-    assert continent_labels()[0] in continent_widget.options
-    country_widget = next(widget for widget in at.selectbox if widget.label == "Country / region")
-    assert "Custom search" in country_widget.options
-    province_widget = next(widget for widget in at.selectbox if widget.label == "Province / state / region")
-    assert "Custom search" in province_widget.options
-    city_widget = next(widget for widget in at.selectbox if widget.label == "City")
-    assert "Custom search" in city_widget.options
+
+
+def test_agent_page_stable_city_candidate_prefills_custom_inputs() -> None:
+    at = AppTest.from_file("pages/4_Historical_Data_Agent.py")
+    at.run()
+
+    next(widget for widget in at.selectbox if widget.label == "Stable city candidate (optional)").select(
+        "Asia - Japan - Kyoto - Kyoto"
+    ).run()
+
+    text_inputs = {widget.label: widget.value for widget in at.text_input}
+    validation = at.session_state["aq_agent_custom_city_validation"]
+
+    assert text_inputs["Country / region"] == "Japan"
+    assert text_inputs["City name"] == "Kyoto"
+    assert at.session_state["aq_agent_custom_city_confirmed"] is True
+    assert validation["corrected_city"] == "Kyoto"
+    assert validation["country_code"] == "JP"
 
 
 def test_custom_city_validated_location_uses_direct_collection_flow(monkeypatch) -> None:
@@ -247,7 +276,6 @@ def test_custom_city_validated_location_uses_direct_collection_flow(monkeypatch)
     at = AppTest.from_file("pages/4_Historical_Data_Agent.py")
     at.secrets["deepseek_api_key"] = "sk-test"
     at.run()
-    next(widget for widget in at.selectbox if widget.label == "City").select("Custom search").run()
     next(widget for widget in at.text_input if widget.label == "Country / region").set_value("Japan").run()
     next(widget for widget in at.text_input if widget.label == "City name").set_value("Tokyo").run()
     next(button for button in at.button if button.label == "Agent: Draft Plan").click().run()
@@ -335,7 +363,6 @@ def test_custom_city_plan_writes_task_status_chain(monkeypatch) -> None:
     at = AppTest.from_file("pages/4_Historical_Data_Agent.py")
     at.secrets["deepseek_api_key"] = "sk-test"
     at.run()
-    next(widget for widget in at.selectbox if widget.label == "City").select("Custom search").run()
     next(widget for widget in at.text_input if widget.label == "Country / region").set_value("Japan").run()
     next(widget for widget in at.text_input if widget.label == "City name").set_value("Tokyo").run()
     next(button for button in at.button if button.label == "Agent: Draft Plan").click().run()
@@ -446,7 +473,6 @@ def test_custom_city_collection_writes_saved_task_status(monkeypatch) -> None:
     at = AppTest.from_file("pages/4_Historical_Data_Agent.py")
     at.secrets["deepseek_api_key"] = "sk-test"
     at.run()
-    next(widget for widget in at.selectbox if widget.label == "City").select("Custom search").run()
     next(widget for widget in at.text_input if widget.label == "Country / region").set_value("Japan").run()
     next(widget for widget in at.text_input if widget.label == "City name").set_value("Tokyo").run()
     next(button for button in at.button if button.label == "Agent: Plan and Collect").click().run()
@@ -462,6 +488,11 @@ def test_custom_city_collection_writes_saved_task_status(monkeypatch) -> None:
     assert task.output_path == "data/processed/agent_runs/tokyo_2024_2026_aq.parquet"
     assert task.result_payload["row_count"] == 1
     assert [log.phase for log in logs] == ["VALIDATING", "RESOLVING", "PLANNING", "COLLECTING", "SAVED"]
+    assert at.session_state["aq_agent_plan"]["city_label"] == "Tokyo, Japan"
+    assert at.session_state["aq_agent_last_result"]["output_path"] == "data/processed/agent_runs/tokyo_2024_2026_aq.parquet"
+    assert Path(at.session_state[DATASET_OVERRIDE_KEY]).as_posix().endswith("data/processed/agent_runs/tokyo_2024_2026_aq.parquet")
+    assert at.session_state[DATASET_CHOICE_KEY] == at.session_state[DATASET_OVERRIDE_KEY]
+    assert PENDING_DATASET_CHOICE_KEY not in at.session_state
     rendered_text = "\n".join(
         [item.value for item in at.markdown]
         + [item.value for item in at.caption]
@@ -560,7 +591,6 @@ def test_custom_city_collection_accepts_chinese_valid_deepseek_status(monkeypatc
     at = AppTest.from_file("pages/4_Historical_Data_Agent.py")
     at.secrets["deepseek_api_key"] = "sk-test"
     at.run()
-    next(widget for widget in at.selectbox if widget.label == "City").select("Custom search").run()
     next(widget for widget in at.text_input if widget.label == "Country / region").set_value("\u4e2d\u56fd").run()
     next(widget for widget in at.text_input if widget.label == "City name").set_value("\u6d4e\u5b81").run()
     next(button for button in at.button if button.label == "Agent: Plan and Collect").click().run()
@@ -655,7 +685,6 @@ def test_custom_city_collection_continues_when_deepseek_success_lacks_country_co
     at = AppTest.from_file("pages/4_Historical_Data_Agent.py")
     at.secrets["deepseek_api_key"] = "sk-test"
     at.run()
-    next(widget for widget in at.selectbox if widget.label == "City").select("Custom search").run()
     next(widget for widget in at.text_input if widget.label == "Country / region").set_value("\u4e2d\u56fd").run()
     next(widget for widget in at.text_input if widget.label == "City name").set_value("\u6d4e\u5b81").run()
     next(button for button in at.button if button.label == "Agent: Plan and Collect").click().run()
@@ -680,7 +709,6 @@ def test_custom_city_validation_failure_shows_task_status_panel(monkeypatch) -> 
     at = AppTest.from_file("pages/4_Historical_Data_Agent.py")
     at.secrets["deepseek_api_key"] = "sk-test"
     at.run()
-    next(widget for widget in at.selectbox if widget.label == "City").select("Custom search").run()
     next(widget for widget in at.text_input if widget.label == "Country / region").set_value("Japan").run()
     next(widget for widget in at.text_input if widget.label == "City name").set_value("Tokyo").run()
     next(button for button in at.button if button.label == "Agent: Draft Plan").click().run()
@@ -732,7 +760,6 @@ def test_custom_city_keeps_progress_when_candidate_resolution_fails(monkeypatch)
     at = AppTest.from_file("pages/4_Historical_Data_Agent.py")
     at.secrets["deepseek_api_key"] = "sk-test"
     at.run()
-    next(widget for widget in at.selectbox if widget.label == "City").select("Custom search").run()
     next(widget for widget in at.text_input if widget.label == "Country / region").set_value("Japan").run()
     next(widget for widget in at.text_input if widget.label == "City name").set_value("Tokyo").run()
     next(button for button in at.button if button.label == "Agent: Draft Plan").click().run()
@@ -825,7 +852,6 @@ def test_custom_city_confirmation_yes_resumes_pending_agent_action(monkeypatch) 
     at = AppTest.from_file("pages/4_Historical_Data_Agent.py")
     at.secrets["deepseek_api_key"] = "sk-test"
     at.run()
-    next(widget for widget in at.selectbox if widget.label == "City").select("Custom search").run()
     next(widget for widget in at.text_input if widget.label == "Country / region").set_value("Japen").run()
     next(widget for widget in at.text_input if widget.label == "City name").set_value("Tokio").run()
     next(button for button in at.button if button.label == "Agent: Draft Plan").click().run()

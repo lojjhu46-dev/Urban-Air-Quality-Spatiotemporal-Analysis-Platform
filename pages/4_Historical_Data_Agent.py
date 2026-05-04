@@ -7,36 +7,13 @@ import streamlit as st
 
 from src.agent_task_store import AgentTaskStatus, PostgresAgentTaskStore, task_store_from_config
 from src.agent_task_runner import AgentTaskRunConfig, start_background_custom_city_task
-from src.agent_interaction import (
-    AgentCityOption,
-    build_agent_instruction,
-    build_city_search_queries,
-    candidate_matches_city_option,
-    city_display_name,
-    city_labels,
-    city_option_from_path,
-    continent_display_name,
-    continent_labels,
-    country_display_name,
-    country_labels,
-    default_city_option,
-    option_has_province_step,
-    province_display_name,
-    province_labels,
-)
+from src.agent_task_watchdog import AgentTaskWatchdogConfig, mark_timed_out_if_needed
+from src.agent_interaction import AgentCityOption, all_city_options
 from src.charts import trend_figure
-from src.collection_agent import (
-    CollectionRequest,
-    build_collection_plan,
-    collection_plan_from_dict,
-    custom_city_validation_from_dict,
-    run_collection_agent,
-    search_city_candidates,
-    validate_custom_city_with_deepseek,
-)
-from src.config import AQ_AGENT_DEFAULT_MODEL, AQ_AGENT_POLLUTANTS, DEEPSEEK_BASE_URL
+from src.collection_agent import custom_city_validation_from_dict, collection_plan_from_dict
+from src.config import AQ_AGENT_DEFAULT_MODEL, AQ_AGENT_POLLUTANTS, AQ_AGENT_TASK_STALLED_SECONDS, AQ_AGENT_TASK_TIMEOUT_SECONDS, DEEPSEEK_BASE_URL
 from src.data import load_dataset
-from src.i18n import api_language, get_language, render_language_selector, t, weather_label
+from src.i18n import get_language, render_language_selector, t, weather_label
 from src.navigation import render_sidebar_navigation
 from src.ui import DATASET_OVERRIDE_KEY, PENDING_DATASET_CHOICE_KEY, dataset_path_from_env, render_dataframe
 
@@ -53,27 +30,23 @@ st.title(t("agent.title", language))
 st.caption(t("agent.caption", language))
 
 CURRENT_YEAR = pd.Timestamp.today().year
-DEFAULT_CITY_OPTION = default_city_option()
 DEFAULT_POLLUTANTS = list(AQ_AGENT_POLLUTANTS)
 DEFAULT_WEATHER_FIELDS = ["temp", "humidity", "wind_speed"]
 
-CONTINENT_KEY = "aq_agent_continent"
-COUNTRY_KEY = "aq_agent_country"
-PROVINCE_KEY = "aq_agent_province"
-CITY_KEY = "aq_agent_city"
 YEARS_KEY = "aq_agent_year_range"
 POLLUTANTS_KEY = "aq_agent_pollutants"
 WEATHER_FIELDS_KEY = "aq_agent_weather_fields"
 USE_DEEPSEEK_KEY = "aq_agent_use_deepseek"
-CUSTOM_CITY_OPTION_VALUE = t("agent.custom_city_option", "en")
 CUSTOM_COUNTRY_KEY = "aq_agent_custom_country"
 CUSTOM_CITY_NAME_KEY = "aq_agent_custom_city_name"
 CUSTOM_VALIDATION_KEY = "aq_agent_custom_city_validation"
 CUSTOM_CONFIRMED_KEY = "aq_agent_custom_city_confirmed"
-CUSTOM_PENDING_ACTION_KEY = "aq_agent_custom_city_pending_action"
+STABLE_CITY_OPTION_KEY = "aq_agent_stable_city_option"
+STABLE_CITY_APPLIED_KEY = "aq_agent_stable_city_option_applied"
 TASK_STORE_KEY = "aq_agent_task_store"
 TASK_STORE_URL_KEY = "aq_agent_task_store_url"
 CURRENT_TASK_KEY = "aq_agent_current_task_id"
+SYNCED_TASK_RESULT_KEY = "aq_agent_synced_task_result"
 TERMINAL_TASK_STATUSES = {
     AgentTaskStatus.PLANNED,
     AgentTaskStatus.SAVED,
@@ -91,6 +64,33 @@ def _safe_secret(key: str) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _safe_secret_int(key: str, default: int) -> int:
+    value = _safe_secret(key)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _agent_task_timeout_seconds() -> int:
+    return _safe_secret_int("agent_task_timeout_seconds", AQ_AGENT_TASK_TIMEOUT_SECONDS)
+
+
+def _agent_task_stalled_seconds() -> int:
+    return _safe_secret_int("agent_task_stalled_seconds", AQ_AGENT_TASK_STALLED_SECONDS)
+
+
+def _task_watchdog_config() -> AgentTaskWatchdogConfig:
+    return AgentTaskWatchdogConfig(
+        max_runtime_seconds=_agent_task_timeout_seconds(),
+        stalled_seconds=_agent_task_stalled_seconds(),
+        language=language,
+    )
 
 
 def _planner_api_key() -> str | None:
@@ -130,7 +130,7 @@ def _task_store():
     return store
 
 
-def _custom_task_payload(action: str, request: CollectionRequest | None = None) -> dict[str, object]:
+def _custom_task_payload(action: str) -> dict[str, object]:
     country, city = _custom_city_inputs()
     start_year, end_year = _selected_years()
     pollutants = _selected_pollutants()
@@ -140,13 +140,13 @@ def _custom_task_payload(action: str, request: CollectionRequest | None = None) 
         "action": action,
         "input_country": country,
         "input_city": city,
-        "city_query": request.city_query if request is not None else city,
-        "country_code": (request.country_code or "") if request is not None else "",
-        "start_year": request.start_year if request is not None else start_year,
-        "end_year": request.end_year if request is not None else end_year,
-        "pollutants": request.normalized_pollutants() if request is not None else pollutants,
-        "include_weather": request.include_weather if request is not None else bool(weather_fields),
-        "weather_fields": request.normalized_weather_fields() if request is not None else weather_fields,
+        "city_query": city,
+        "country_code": "",
+        "start_year": start_year,
+        "end_year": end_year,
+        "pollutants": pollutants,
+        "include_weather": bool(weather_fields),
+        "weather_fields": weather_fields,
     }
     validation = _current_custom_validation()
     if validation is not None and st.session_state.get(CUSTOM_CONFIRMED_KEY):
@@ -154,38 +154,61 @@ def _custom_task_payload(action: str, request: CollectionRequest | None = None) 
     return payload
 
 
-def _start_custom_task(action: str, request: CollectionRequest | None = None):
+def _stable_city_options() -> list[AgentCityOption]:
+    return all_city_options()
+
+
+def _format_stable_city_option(option: AgentCityOption) -> str:
+    return option.path_label_for_language(language)
+
+
+def _stable_city_option_labels() -> list[str]:
+    return [_format_stable_city_option(option) for option in _stable_city_options()]
+
+
+def _stable_city_option_by_label(label: str | None) -> AgentCityOption | None:
+    if not label:
+        return None
+    for option in _stable_city_options():
+        if _format_stable_city_option(option) == label:
+            return option
+    return None
+
+
+def _stable_city_option_identity(option: AgentCityOption) -> tuple[str, str, str | None, str]:
+    return option.continent, option.country, option.province, option.city
+
+
+def _selected_stable_city_option() -> AgentCityOption | None:
+    return _stable_city_option_by_label(str(st.session_state.get(STABLE_CITY_OPTION_KEY) or ""))
+
+
+def _apply_stable_city_option(option: AgentCityOption) -> None:
+    st.session_state[CUSTOM_COUNTRY_KEY] = option.display_country(language)
+    st.session_state[CUSTOM_CITY_NAME_KEY] = option.display_city(language)
+    st.session_state[CUSTOM_VALIDATION_KEY] = {
+        "input_country": option.display_country(language),
+        "input_city": option.display_city(language),
+        "status": "valid",
+        "corrected_country": option.country,
+        "corrected_city": option.city_query,
+        "country_code": option.country_code,
+        "matching_countries": [option.country],
+        "message": t(
+            "agent.stable_city_prefill_message",
+            language,
+            city=option.display_city(language),
+            country=option.display_country(language),
+        ),
+    }
+    st.session_state[CUSTOM_CONFIRMED_KEY] = True
+
+
+def _start_custom_task(action: str):
     store = _task_store()
-    task = store.create_task(kind="custom_city_collection", request_payload=_custom_task_payload(action, request))
+    task = store.create_task(kind="custom_city_collection", request_payload=_custom_task_payload(action))
     st.session_state[CURRENT_TASK_KEY] = task.task_id
     return store, task.task_id
-
-
-def _record_task_step(
-    store,
-    task_id: str,
-    *,
-    status_value: AgentTaskStatus,
-    phase: str,
-    progress_value: float,
-    message: str,
-    result_payload: dict[str, object] | None = None,
-    error: str | None = None,
-    output_path: str | None = None,
-    log: bool = True,
-) -> None:
-    store.update_task(
-        task_id,
-        status=status_value,
-        phase=phase,
-        progress=progress_value,
-        message=message,
-        result_payload=result_payload,
-        error=error,
-        output_path=output_path,
-    )
-    if log:
-        store.append_log(task_id, level="error" if status_value == AgentTaskStatus.FAILED else "info", phase=phase, message=message)
 
 
 def _format_task_timestamp(value) -> str:
@@ -194,7 +217,18 @@ def _format_task_timestamp(value) -> str:
     return str(value).replace("+00:00", " UTC")
 
 
-def _sync_task_result_to_session(task) -> None:
+def _task_result_signature(task) -> tuple[str, str, str]:
+    return task.task_id, task.status.value, task.output_path or ""
+
+
+def _sync_task_result_to_session(task) -> bool:
+    if task.status not in {AgentTaskStatus.PLANNED, AgentTaskStatus.SAVED} or not task.result_payload:
+        return False
+
+    signature = _task_result_signature(task)
+    if st.session_state.get(SYNCED_TASK_RESULT_KEY) == signature:
+        return False
+
     if task.status == AgentTaskStatus.PLANNED and task.result_payload:
         st.session_state["aq_agent_plan"] = dict(task.result_payload)
     if task.status == AgentTaskStatus.SAVED and task.result_payload:
@@ -214,6 +248,8 @@ def _sync_task_result_to_session(task) -> None:
             "started_at": str(task.result_payload.get("started_at") or ""),
             "ended_at": str(task.result_payload.get("ended_at") or ""),
         }
+    st.session_state[SYNCED_TASK_RESULT_KEY] = signature
+    return True
 
 
 def _render_task_confirmation_controls(task) -> None:
@@ -254,6 +290,7 @@ def _render_task_confirmation_controls(task) -> None:
                 model=_planner_model(),
                 base_url=_planner_base_url(),
                 language=language,
+                timeout_seconds=_agent_task_timeout_seconds(),
             ),
         )
         st.success(t("agent.custom_city_confirmed", language, city=city_label, country=country_label))
@@ -273,6 +310,9 @@ def _render_task_status_panel_body() -> None:
         store = _task_store()
         task = store.get_task(str(task_id))
         logs = store.list_logs(str(task_id), limit=20)
+        if task is not None:
+            task = mark_timed_out_if_needed(store, task, logs, _task_watchdog_config())
+            logs = store.list_logs(str(task_id), limit=20)
     except Exception as exc:  # noqa: BLE001
         st.warning(t("agent.task_status_unavailable", language, error=exc))
         return
@@ -281,7 +321,7 @@ def _render_task_status_panel_body() -> None:
         st.info(t("agent.task_status_missing", language, task_id=task_id))
         return
 
-    _sync_task_result_to_session(task)
+    synced_task_result = _sync_task_result_to_session(task)
 
     st.subheader(t("agent.task_status_section", language))
     st.caption(
@@ -329,6 +369,9 @@ def _render_task_status_panel_body() -> None:
                         message=log.message,
                     )
                 )
+
+    if synced_task_result:
+        st.rerun(scope="app")
 
 
 def _render_task_status_panel_once(container=None) -> None:
@@ -381,22 +424,6 @@ def _render_current_task_confirmation_panel() -> None:
     _task_confirmation_fragment()
 
 
-def _ensure_state_value(key: str, options: list[str], default_value: str) -> None:
-    if not options:
-        st.session_state.pop(key, None)
-        return
-    if st.session_state.get(key) not in options:
-        st.session_state[key] = default_value if default_value in options else options[0]
-
-
-def _is_custom_city_selected() -> bool:
-    return CUSTOM_CITY_OPTION_VALUE in {
-        st.session_state.get(COUNTRY_KEY),
-        st.session_state.get(PROVINCE_KEY),
-        st.session_state.get(CITY_KEY),
-    }
-
-
 def _custom_city_inputs() -> tuple[str, str]:
     return (
         str(st.session_state.get(CUSTOM_COUNTRY_KEY) or "").strip(),
@@ -407,7 +434,6 @@ def _custom_city_inputs() -> tuple[str, str]:
 def _clear_custom_city_validation() -> None:
     st.session_state.pop(CUSTOM_VALIDATION_KEY, None)
     st.session_state.pop(CUSTOM_CONFIRMED_KEY, None)
-    st.session_state.pop(CUSTOM_PENDING_ACTION_KEY, None)
 
 
 def _current_custom_validation():
@@ -422,29 +448,23 @@ def _current_custom_validation():
     return validation
 
 
-def _current_city_option() -> AgentCityOption:
-    return city_option_from_path(
-        st.session_state[CONTINENT_KEY],
-        st.session_state[COUNTRY_KEY],
-        st.session_state.get(PROVINCE_KEY) or None,
-        st.session_state[CITY_KEY],
-    )
+def _default_year_range() -> tuple[int, int]:
+    supported_start_year = 2013
+    default_start = max(supported_start_year, CURRENT_YEAR - 2)
+    return default_start, CURRENT_YEAR
 
 
 def _selected_years() -> tuple[int, int]:
-    supported_start_year = 2013 if _is_custom_city_selected() else _current_city_option().supported_start_year
-    default_start = max(supported_start_year, CURRENT_YEAR - 2)
-    default_value = (default_start, CURRENT_YEAR)
+    supported_start_year = 2013
+    default_value = _default_year_range()
     value = st.session_state.get(YEARS_KEY, default_value)
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        value = default_value
     start_year = max(int(value[0]), supported_start_year)
     end_year = min(int(value[1]), CURRENT_YEAR)
     if start_year > end_year:
         start_year = supported_start_year
     return start_year, end_year
-
-
-def _prime_year_state() -> None:
-    st.session_state[YEARS_KEY] = _selected_years()
 
 
 def _selected_pollutants() -> list[str]:
@@ -459,256 +479,26 @@ def _selected_weather_fields() -> list[str]:
     return normalized
 
 
-def _custom_collection_request(validation) -> CollectionRequest:
-    start_year, end_year = _selected_years()
-    weather_fields = _selected_weather_fields()
-    country, city = _custom_city_inputs()
-    return CollectionRequest(
-        city_query=validation.corrected_city or city,
-        start_year=start_year,
-        end_year=end_year,
-        pollutants=_selected_pollutants(),
-        include_weather=bool(weather_fields),
-        country_code=validation.country_code,
-        weather_fields=weather_fields,
-    )
-
-
-def _current_request() -> CollectionRequest:
-    if _is_custom_city_selected():
-        validation = _current_custom_validation()
-        if validation is None:
-            country, city = _custom_city_inputs()
-            start_year, end_year = _selected_years()
-            weather_fields = _selected_weather_fields()
-            return CollectionRequest(
-                city_query=city,
-                start_year=start_year,
-                end_year=end_year,
-                pollutants=_selected_pollutants(),
-                include_weather=bool(weather_fields),
-                country_code=None,
-                weather_fields=weather_fields,
-            )
-        return _custom_collection_request(validation)
-
-    city_option = _current_city_option()
-    start_year, end_year = _selected_years()
-    weather_fields = _selected_weather_fields()
-    return CollectionRequest(
-        city_query=city_option.city_query,
-        start_year=start_year,
-        end_year=end_year,
-        pollutants=_selected_pollutants(),
-        include_weather=bool(weather_fields),
-        country_code=city_option.country_code,
-        weather_fields=weather_fields,
-    )
-
-
 def _current_instruction() -> str:
-    if _is_custom_city_selected():
-        country, city = _custom_city_inputs()
-        start_year, end_year = _selected_years()
-        pollutant_text = ", ".join(pollutant.upper() for pollutant in _selected_pollutants())
-        weather_fields = _selected_weather_fields()
-        weather_clause = (
-            t("collection.weather_with_fields", language, fields=", ".join(weather_label(field, language) for field in weather_fields))
-            if weather_fields
-            else t("collection.weather_without", language)
-        )
-        return t(
-            "agent.custom_instruction",
-            language,
-            city=city or t("agent.custom_city_name", language),
-            country=country or t("agent.custom_city_country", language),
-            start_year=start_year,
-            end_year=end_year,
-            pollutants=pollutant_text,
-            weather_clause=weather_clause,
-        )
-
-    city_option = _current_city_option()
-    start_year, end_year = _selected_years()
-    return build_agent_instruction(
-        city_option,
-        start_year,
-        end_year,
-        _selected_pollutants(),
-        _selected_weather_fields(),
-        language=language,
-    )
-
-
-def _format_province_option(province: str) -> str:
-    if province == CUSTOM_CITY_OPTION_VALUE:
-        return t("agent.custom_city_option", language)
-    return (
-        province_display_name(
-            st.session_state.get(CONTINENT_KEY) or "",
-            st.session_state.get(COUNTRY_KEY) or "",
-            province,
-            language,
-        )
-        or province
-    )
-
-
-def _format_city_option(city: str) -> str:
-    if city == CUSTOM_CITY_OPTION_VALUE:
-        return t("agent.custom_city_option", language)
-    return city_display_name(
-        st.session_state.get(CONTINENT_KEY) or "",
-        st.session_state.get(COUNTRY_KEY) or "",
-        st.session_state.get(PROVINCE_KEY) or None,
-        city,
-        language,
-    )
-
-
-def _format_continent_option(continent: str) -> str:
-    return continent_display_name(continent, language)
-
-
-def _format_country_option(country: str) -> str:
-    if country == CUSTOM_CITY_OPTION_VALUE:
-        return t("agent.custom_city_option", language)
-    return country_display_name(st.session_state.get(CONTINENT_KEY) or "", country, language)
-
-
-def _resolve_selected_candidate() -> object:
-    city_option = _current_city_option()
-    latest_candidates = []
-    for query in build_city_search_queries(city_option):
-        candidates = search_city_candidates(query, country_code=city_option.country_code, count=10, language="en")
-        latest_candidates = candidates
-        for candidate in candidates:
-            if candidate_matches_city_option(
-                city_option,
-                candidate_name=candidate.name,
-                candidate_admin1=candidate.admin1,
-                candidate_country_code=candidate.country_code,
-            ):
-                return candidate
-    if latest_candidates:
-        return latest_candidates[0]
-    raise ValueError(t("agent.city_not_found", language, city=city_option.path_label_for_language(language)))
-
-
-def _prepare_custom_city_run(api_key: str | None, action: str, task_store=None, task_id: str | None = None):
     country, city = _custom_city_inputs()
-    if not country or not city:
-        st.warning(t("agent.custom_city_inputs_required", language))
-        return None
-    if not api_key:
-        st.error(t("agent.custom_city_requires_key", language))
-        return None
-
-    validation = _current_custom_validation()
-    confirmed = bool(st.session_state.get(CUSTOM_CONFIRMED_KEY))
-    if validation is None or not confirmed:
-        validation = validate_custom_city_with_deepseek(
-            country,
-            city,
-            api_key=api_key,
-            model=_planner_model(),
-            base_url=_planner_base_url(),
-            language=language,
-        )
-        st.session_state[CUSTOM_VALIDATION_KEY] = validation.to_dict()
-        st.session_state[CUSTOM_CONFIRMED_KEY] = validation.status == "valid"
-        confirmed = validation.status == "valid"
-
-    if validation.status == "low_confidence":
-        message = validation.message or t("agent.custom_city_low_confidence", language)
-        st.warning(message)
-        if task_store is not None and task_id is not None:
-            _record_task_step(
-                task_store,
-                task_id,
-                status_value=AgentTaskStatus.FAILED,
-                phase="FAILED",
-                progress_value=1.0,
-                message=message,
-                error=message,
-            )
-        return None
-
-    if validation.status == "needs_confirmation" and not confirmed:
-        st.session_state[CUSTOM_PENDING_ACTION_KEY] = action
-        message = validation.message or t(
-            "agent.custom_city_confirmation",
-            language,
-            city=validation.corrected_city or validation.input_city,
-            country=validation.corrected_country or validation.input_country,
-        )
-        if task_store is not None and task_id is not None:
-            _record_task_step(
-                task_store,
-                task_id,
-                status_value=AgentTaskStatus.PENDING,
-                phase="AWAITING_CONFIRMATION",
-                progress_value=0.12,
-                message=message,
-            )
-        st.warning(message)
-        st.rerun()
-        return None
-
-    if not validation.country_code and validation.status != "valid":
-        message = t("agent.custom_city_country_code_missing", language)
-        st.error(message)
-        if task_store is not None and task_id is not None:
-            _record_task_step(
-                task_store,
-                task_id,
-                status_value=AgentTaskStatus.FAILED,
-                phase="FAILED",
-                progress_value=1.0,
-                message=message,
-                error=message,
-            )
-        return None
-
-    return _custom_collection_request(validation)
-
-
-def _resolve_custom_candidate(request: CollectionRequest) -> object:
-    candidates = search_city_candidates(
-        request.city_query,
-        country_code=request.country_code,
-        count=10,
-        language=api_language(language),
+    start_year, end_year = _selected_years()
+    pollutant_text = ", ".join(pollutant.upper() for pollutant in _selected_pollutants())
+    weather_fields = _selected_weather_fields()
+    weather_clause = (
+        t("collection.weather_with_fields", language, fields=", ".join(weather_label(field, language) for field in weather_fields))
+        if weather_fields
+        else t("collection.weather_without", language)
     )
-    if candidates:
-        return candidates[0]
-    raise ValueError(
-        t(
-            "agent.city_not_found",
-            language,
-            city=f"{request.city_query}, {request.country_code or t('agent.custom_city_country', language)}",
-        )
+    return t(
+        "agent.custom_instruction",
+        language=language,
+        city=city or t("agent.custom_city_name", language),
+        country=country or t("agent.custom_city_country", language),
+        start_year=start_year,
+        end_year=end_year,
+        pollutants=pollutant_text,
+        weather_clause=weather_clause,
     )
-
-
-def _remember_plan(plan) -> None:
-    st.session_state["aq_agent_plan"] = plan.to_dict()
-
-
-def _remember_collection_result(result) -> None:
-    _remember_plan(result.plan)
-    st.session_state[DATASET_OVERRIDE_KEY] = result.output_path
-    st.session_state[PENDING_DATASET_CHOICE_KEY] = result.output_path
-    st.session_state["aq_agent_last_result"] = {
-        "output_path": result.output_path,
-        "summary_text": result.summary_text,
-        "summary_mode": result.summary_mode,
-        "runtime_warnings": result.runtime_warnings,
-        "coverage_rows": result.coverage_rows,
-        "row_count": result.row_count,
-        "started_at": result.started_at,
-        "ended_at": result.ended_at,
-    }
 
 
 def _render_plan(plan) -> None:
@@ -756,42 +546,6 @@ def _render_plan(plan) -> None:
         st.write(t("agent.chunk_preview", language))
         render_dataframe(pd.DataFrame(plan.chunks), use_container_width=True, hide_index=True)
 
-
-continent_options = continent_labels()
-_ensure_state_value(CONTINENT_KEY, continent_options, DEFAULT_CITY_OPTION.continent)
-
-country_options = [*country_labels(st.session_state[CONTINENT_KEY]), CUSTOM_CITY_OPTION_VALUE]
-_ensure_state_value(COUNTRY_KEY, country_options, DEFAULT_CITY_OPTION.country)
-
-country_is_custom = st.session_state[COUNTRY_KEY] == CUSTOM_CITY_OPTION_VALUE
-province_required = (
-    not country_is_custom
-    and option_has_province_step(st.session_state[CONTINENT_KEY], st.session_state[COUNTRY_KEY])
-)
-province_options = (
-    [*province_labels(st.session_state[CONTINENT_KEY], st.session_state[COUNTRY_KEY]), CUSTOM_CITY_OPTION_VALUE]
-    if province_required
-    else []
-)
-if province_required:
-    _ensure_state_value(PROVINCE_KEY, province_options, DEFAULT_CITY_OPTION.province or province_options[0])
-else:
-    st.session_state[PROVINCE_KEY] = ""
-
-province_is_custom = st.session_state.get(PROVINCE_KEY) == CUSTOM_CITY_OPTION_VALUE
-available_city_labels = (
-    []
-    if country_is_custom or province_is_custom
-    else city_labels(
-        st.session_state[CONTINENT_KEY],
-        st.session_state[COUNTRY_KEY],
-        st.session_state.get(PROVINCE_KEY) or None,
-    )
-)
-city_select_options = [*available_city_labels, CUSTOM_CITY_OPTION_VALUE]
-_ensure_state_value(CITY_KEY, city_select_options, DEFAULT_CITY_OPTION.city)
-_prime_year_state()
-
 with st.expander(t("agent.deepseek_settings", language), expanded=False):
     st.text_input(t("agent.model", language), value=_safe_secret("deepseek_model") or AQ_AGENT_DEFAULT_MODEL, key="aq_agent_model")
     st.text_input(t("agent.base_url", language), value=_safe_secret("deepseek_base_url") or DEEPSEEK_BASE_URL, key="aq_agent_base_url")
@@ -806,120 +560,67 @@ with st.expander(t("agent.deepseek_settings", language), expanded=False):
 st.subheader(t("agent.request_section", language))
 st.caption(t("agent.request_caption", language))
 
-row1_left, row1_right = st.columns((1, 1))
-with row1_left:
-    st.selectbox(
-        t("agent.continent_select", language),
-        options=continent_options,
-        format_func=_format_continent_option,
-        key=CONTINENT_KEY,
-    )
-with row1_right:
-    st.selectbox(
-        t("agent.country_select", language),
-        options=country_options,
-        format_func=_format_country_option,
-        key=COUNTRY_KEY,
-    )
+st.caption(t("agent.custom_city_caption", language))
+stable_city_options = _stable_city_options()
+st.selectbox(
+    t("agent.stable_city_select", language),
+    options=_stable_city_option_labels(),
+    index=None,
+    placeholder=t("agent.stable_city_placeholder", language),
+    key=STABLE_CITY_OPTION_KEY,
+)
+selected_stable_city_option = _selected_stable_city_option()
+if selected_stable_city_option is not None:
+    selected_label = str(st.session_state.get(STABLE_CITY_OPTION_KEY) or "")
+    if st.session_state.get(STABLE_CITY_APPLIED_KEY) != selected_label:
+        _apply_stable_city_option(selected_stable_city_option)
+        st.session_state[STABLE_CITY_APPLIED_KEY] = selected_label
+        st.rerun()
 
-row2_left, row2_right = st.columns((1, 1))
-with row2_left:
-    if province_required:
-        st.selectbox(
-            t("agent.province_select", language),
-            options=province_options,
-            format_func=_format_province_option,
-            key=PROVINCE_KEY,
+custom_left, custom_right = st.columns((1, 1))
+with custom_left:
+    st.text_input(t("agent.custom_city_country", language), key=CUSTOM_COUNTRY_KEY)
+with custom_right:
+    st.text_input(t("agent.custom_city_name", language), key=CUSTOM_CITY_NAME_KEY)
+
+validation = _current_custom_validation()
+if validation is not None:
+    if validation.status == "low_confidence":
+        st.warning(validation.message or t("agent.custom_city_low_confidence", language))
+    elif validation.status == "needs_confirmation" and not st.session_state.get(CUSTOM_CONFIRMED_KEY):
+        city_label = validation.corrected_city or validation.input_city
+        country_label = validation.corrected_country or validation.input_country
+        st.warning(
+            validation.message
+            or t("agent.custom_city_confirmation", language, city=city_label, country=country_label)
         )
-    else:
-        st.text_input(t("agent.province_select", language), value=t("agent.province_skip", language), disabled=True)
-with row2_right:
-    st.selectbox(
-        t("agent.city_select", language),
-        options=city_select_options,
-        format_func=_format_city_option,
-        key=CITY_KEY,
-    )
-
-pending_custom_action = None
-if _is_custom_city_selected():
-    st.caption(t("agent.custom_city_caption", language))
-    custom_left, custom_right = st.columns((1, 1))
-    with custom_left:
-        st.text_input(t("agent.custom_city_country", language), key=CUSTOM_COUNTRY_KEY)
-    with custom_right:
-        st.text_input(t("agent.custom_city_name", language), key=CUSTOM_CITY_NAME_KEY)
-
-    validation = _current_custom_validation()
-    if validation is not None:
-        if validation.status == "low_confidence":
-            st.warning(validation.message or t("agent.custom_city_low_confidence", language))
-        elif validation.status == "needs_confirmation" and not st.session_state.get(CUSTOM_CONFIRMED_KEY):
-            city_label = validation.corrected_city or validation.input_city
-            country_label = validation.corrected_country or validation.input_country
-            st.warning(
-                validation.message
-                or t("agent.custom_city_confirmation", language, city=city_label, country=country_label)
-            )
-            if validation.matching_countries:
-                st.info(
-                    t(
-                        "agent.custom_city_matching_countries",
-                        language,
-                        countries=", ".join(validation.matching_countries),
-                    )
-                )
-            confirm_left, confirm_right = st.columns((1, 1))
-            if confirm_left.button(t("agent.custom_city_confirm_yes", language), use_container_width=True):
-                if validation.country_code:
-                    st.session_state[CUSTOM_CONFIRMED_KEY] = True
-                    pending_custom_action = st.session_state.get(CUSTOM_PENDING_ACTION_KEY)
-                    st.success(
-                        t(
-                            "agent.custom_city_confirmed",
-                            language,
-                            city=city_label,
-                            country=country_label,
-                        )
-                    )
-                else:
-                    st.error(t("agent.custom_city_country_code_missing", language))
-            if confirm_right.button(t("agent.custom_city_confirm_no", language), use_container_width=True):
-                _clear_custom_city_validation()
-                st.rerun()
-        else:
-            st.success(
+        if validation.matching_countries:
+            st.info(
                 t(
-                    "agent.custom_city_confirmed",
+                    "agent.custom_city_matching_countries",
                     language,
-                    city=validation.corrected_city or validation.input_city,
-                    country=validation.corrected_country or validation.input_country,
+                    countries=", ".join(validation.matching_countries),
                 )
             )
-
-    st.info(t("agent.custom_support_window", language))
-else:
-    selected_city = _current_city_option()
-    source_name, source_window = selected_city.source_summary
-    st.caption(t("agent.city_catalog_hint", language))
-    st.info(
-        t(
-            "agent.support_window",
-            language,
-            path=selected_city.path_label_for_language(language),
-            source=source_name,
-            window=source_window,
+    else:
+        st.success(
+            t(
+                "agent.custom_city_confirmed",
+                language,
+                city=validation.corrected_city or validation.input_city,
+                country=validation.corrected_country or validation.input_country,
+            )
         )
-    )
-    if selected_city.country_code == "CN" and _planner_api_key():
-        st.caption(t("agent.deepseek_proxy_hint", language))
+
+st.info(t("agent.custom_support_window", language))
 
 left, right = st.columns((1, 1))
 with left:
     st.slider(
         t("agent.year_range", language),
-        min_value=2013 if _is_custom_city_selected() else selected_city.supported_start_year,
+        min_value=2013,
         max_value=CURRENT_YEAR,
+        value=_default_year_range(),
         key=YEARS_KEY,
     )
 with right:
@@ -945,12 +646,6 @@ with st.expander(t("agent.request_preview", language), expanded=False):
 agent_left, agent_right = st.columns((1, 1))
 agent_plan_clicked = agent_left.button(t("agent.draft_plan", language), use_container_width=True)
 agent_collect_clicked = agent_right.button(t("agent.plan_and_collect", language), type="primary", use_container_width=True)
-if pending_custom_action == "plan":
-    agent_plan_clicked = True
-    st.session_state.pop(CUSTOM_PENDING_ACTION_KEY, None)
-elif pending_custom_action == "collect":
-    agent_collect_clicked = True
-    st.session_state.pop(CUSTOM_PENDING_ACTION_KEY, None)
 
 task_status_slot = st.empty()
 
@@ -959,92 +654,32 @@ if agent_plan_clicked or agent_collect_clicked:
     status = st.empty()
     api_key = _planner_api_key()
     action = "collect" if agent_collect_clicked else "plan"
-    active_task_store = None
-    active_task_id = None
-
-    def _progress(step: int, total: int, message: str) -> None:
-        progress_value = min(step / max(total, 1), 1.0)
-        progress.progress(progress_value)
-        status.caption(message)
-        if active_task_store is not None and active_task_id is not None:
-            _record_task_step(
-                active_task_store,
-                active_task_id,
-                status_value=AgentTaskStatus.RUNNING,
-                phase="COLLECTING",
-                progress_value=progress_value,
-                message=message,
-            )
-
     try:
         progress.progress(0.08)
-        if _is_custom_city_selected():
-            country, city = _custom_city_inputs()
-            if not country or not city:
-                progress.empty()
-                status.warning(t("agent.custom_city_inputs_required", language))
-            elif not api_key:
-                progress.empty()
-                status.error(t("agent.custom_city_requires_key", language))
-            else:
-                active_task_store, active_task_id = _start_custom_task(action)
-                start_background_custom_city_task(
-                    active_task_store,
-                    active_task_id,
-                    AgentTaskRunConfig(
-                        api_key=api_key,
-                        model=_planner_model(),
-                        base_url=_planner_base_url(),
-                        language=language,
-                    ),
-                )
-                progress.empty()
-                status.success(t("agent.task_started", language))
-                _render_task_status_panel_once(task_status_slot)
+        country, city = _custom_city_inputs()
+        if not country or not city:
+            progress.empty()
+            status.warning(t("agent.custom_city_inputs_required", language))
+        elif not api_key:
+            progress.empty()
+            status.error(t("agent.custom_city_requires_key", language))
         else:
-            request = _current_request()
-            status.caption(t("agent.resolving_city", language))
-            candidate = _resolve_selected_candidate()
-            progress.progress(0.18)
-            status.caption(t("agent.building_plan", language))
-            if agent_collect_clicked:
-                result = run_collection_agent(
-                    request,
-                    candidate,
-                    api_key=api_key,
-                    model=_planner_model(),
-                    base_url=_planner_base_url(),
-                    progress_callback=_progress,
-                    language=language,
-                )
-                _remember_collection_result(result)
-                progress.progress(1.0)
-                status.success(t("agent.tool_completed", language))
-                st.rerun()
-            else:
-                plan = build_collection_plan(
-                    request,
-                    candidate,
-                    api_key=api_key,
-                    model=_planner_model(),
-                    base_url=_planner_base_url(),
-                    language=language,
-                )
-                _remember_plan(plan)
-                progress.progress(1.0)
-                status.success(t("agent.tool_completed", language))
-    except Exception as exc:  # noqa: BLE001
-        if active_task_store is not None and active_task_id is not None:
-            _record_task_step(
+            active_task_store, active_task_id = _start_custom_task(action)
+            start_background_custom_city_task(
                 active_task_store,
                 active_task_id,
-                status_value=AgentTaskStatus.FAILED,
-                phase="FAILED",
-                progress_value=1.0,
-                message=str(exc),
-                error=str(exc),
+                AgentTaskRunConfig(
+                    api_key=api_key,
+                    model=_planner_model(),
+                    base_url=_planner_base_url(),
+                    language=language,
+                    timeout_seconds=_agent_task_timeout_seconds(),
+                ),
             )
-        status.error(t("agent.tool_failed", language, error=exc))
+            progress.empty()
+            status.success(t("agent.task_started", language))
+            _render_task_status_panel_once(task_status_slot)
+    except Exception as exc:  # noqa: BLE001
         st.error(t("agent.tool_failed", language, error=exc))
 
 _render_current_task_status_panel(task_status_slot)

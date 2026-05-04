@@ -177,6 +177,10 @@ def city_options(continent: str, country: str, province: str | None = None) -> l
     return sorted(filtered, key=lambda option: option.sort_key)
 
 
+def all_city_options() -> list[AgentCityOption]:
+    return list(_CATALOG)
+
+
 def city_option_from_path(continent: str, country: str, province: str | None, city: str) -> AgentCityOption:
     for option in _CATALOG:
         if option.continent == continent and option.country == country and option.province == (province or None) and option.city == city:

@@ -4,11 +4,13 @@ from dataclasses import dataclass
 from threading import Thread
 from time import monotonic
 from typing import Protocol
+import unicodedata
 
 import src.collection_agent as collection_agent
+from src.agent_interaction import all_city_options, build_city_search_queries
 from src.agent_task_store import AgentTaskStatus
 from src.collection_agent import CollectionRequest, custom_city_validation_from_dict
-from src.config import AQ_AGENT_DEFAULT_MODEL, DEEPSEEK_BASE_URL
+from src.config import AQ_AGENT_DEFAULT_MODEL, AQ_AGENT_TASK_TIMEOUT_SECONDS, DEEPSEEK_BASE_URL
 from src.i18n import api_language, t
 
 
@@ -37,7 +39,7 @@ class AgentTaskRunConfig:
     model: str = AQ_AGENT_DEFAULT_MODEL
     base_url: str = DEEPSEEK_BASE_URL
     language: str = "en"
-    timeout_seconds: int = 1800
+    timeout_seconds: int = AQ_AGENT_TASK_TIMEOUT_SECONDS
 
 
 _ACTIVE_THREADS: dict[str, Thread] = {}
@@ -145,13 +147,13 @@ def run_custom_city_task(store: AgentTaskStore, task_id: str, config: AgentTaskR
             progress=0.24,
             message=t("agent.resolving_city", config.language),
         )
-        candidates = collection_agent.search_city_candidates(
-            request.city_query,
-            country_code=request.country_code,
-            count=10,
+        candidate, resolved_query = _resolve_city_candidate(
+            request,
+            payload,
+            validation,
             language=api_language(config.language),
         )
-        if not candidates:
+        if candidate is None:
             raise ValueError(
                 t(
                     "agent.city_not_found",
@@ -159,7 +161,7 @@ def run_custom_city_task(store: AgentTaskStore, task_id: str, config: AgentTaskR
                     city=f"{request.city_query}, {request.country_code or t('agent.custom_city_country', config.language)}",
                 )
             )
-        candidate = candidates[0]
+        request.city_query = resolved_query
 
         check_timeout()
         _record_step(
@@ -244,6 +246,107 @@ def _collection_request_from_payload(payload: dict[str, object], validation) -> 
     )
 
 
+def _resolve_city_candidate(
+    request: CollectionRequest,
+    payload: dict[str, object],
+    validation,
+    *,
+    language: str,
+):
+    for query in _city_candidate_queries(request, payload, validation):
+        candidates = collection_agent.search_city_candidates(
+            query,
+            country_code=request.country_code,
+            count=10,
+            language=language,
+        )
+        if candidates:
+            return candidates[0], query
+    return None, request.city_query
+
+
+def _city_candidate_queries(request: CollectionRequest, payload: dict[str, object], validation) -> list[str]:
+    base_queries = [
+        request.city_query,
+        getattr(validation, "corrected_city", None),
+        getattr(validation, "input_city", None),
+        payload.get("input_city"),
+        payload.get("city_query"),
+    ]
+    catalog_queries: list[str] = []
+    for option in _matching_catalog_city_options(payload, validation):
+        catalog_queries.extend(build_city_search_queries(option))
+    return _unique_strings([*base_queries, *catalog_queries])
+
+
+def _matching_catalog_city_options(payload: dict[str, object], validation):
+    city_keys = {
+        _normalize_match_value(value)
+        for value in [
+            getattr(validation, "corrected_city", None),
+            getattr(validation, "input_city", None),
+            payload.get("input_city"),
+            payload.get("city_query"),
+        ]
+        if _normalize_match_value(value)
+    }
+    country_keys = {
+        _normalize_match_value(value)
+        for value in [
+            getattr(validation, "corrected_country", None),
+            getattr(validation, "input_country", None),
+            getattr(validation, "country_code", None),
+            payload.get("input_country"),
+            payload.get("country_code"),
+        ]
+        if _normalize_match_value(value)
+    }
+    if not city_keys or not country_keys:
+        return []
+
+    matches = []
+    for option in _all_catalog_city_options():
+        option_country_keys = {
+            _normalize_match_value(option.country_code),
+            _normalize_match_value(option.country),
+            _normalize_match_value(option.display_country("en")),
+            _normalize_match_value(option.display_country("zh-CN")),
+        }
+        if country_keys.isdisjoint(option_country_keys):
+            continue
+
+        option_city_keys = {
+            _normalize_match_value(option.city),
+            _normalize_match_value(option.city_query),
+            _normalize_match_value(option.display_city("en")),
+            _normalize_match_value(option.display_city("zh-CN")),
+        }
+        if not city_keys.isdisjoint(option_city_keys):
+            matches.append(option)
+    return matches
+
+
+def _all_catalog_city_options():
+    return all_city_options()
+
+
+def _normalize_match_value(value) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return "".join(char for char in text if char.isalnum())
+
+
+def _unique_strings(values) -> list[str]:
+    seen: set[str] = set()
+    output: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        output.append(text)
+        seen.add(text)
+    return output
+
+
 def _record_step(
     store: AgentTaskStore,
     task_id: str,
@@ -257,6 +360,14 @@ def _record_step(
     output_path: str | None = None,
     log: bool = True,
 ) -> None:
+    existing = store.get_task(task_id)
+    if existing is not None and existing.status in {
+        AgentTaskStatus.PLANNED,
+        AgentTaskStatus.SAVED,
+        AgentTaskStatus.FAILED,
+        AgentTaskStatus.TIMEOUT,
+    }:
+        return
     store.update_task(
         task_id,
         status=status,

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 
 import pandas as pd
+import pytest
 
 import src.collection_agent as collection_agent
 from src.collection_agent import (
@@ -14,12 +15,14 @@ from src.collection_agent import (
     build_collection_plan,
     chunk_date_range,
     execute_collection_agent_tool,
+    fetch_weather_chunk,
     finalize_collected_dataset,
     get_collection_agent_tool_schemas,
     resolve_supported_window,
     run_deepseek_tool_agent,
     summarize_dataset_coverage,
     validate_custom_city_with_deepseek,
+    weather_archive_chunk_window,
 )
 
 
@@ -120,6 +123,48 @@ def test_chunk_date_range_is_inclusive() -> None:
 
     assert chunks[0] == {"start_date": "2024-01-01", "end_date": "2024-01-30"}
     assert chunks[-1] == {"start_date": "2024-03-31", "end_date": "2024-04-05"}
+
+
+def test_weather_archive_chunk_window_clips_recent_unavailable_days() -> None:
+    chunk = {"start_date": "2026-03-21", "end_date": "2026-05-05"}
+
+    assert weather_archive_chunk_window(chunk, today=date(2026, 5, 5)) == ("2026-03-21", "2026-04-30")
+    assert weather_archive_chunk_window({"start_date": "2026-05-01", "end_date": "2026-05-05"}, today=date(2026, 5, 5)) is None
+
+
+def test_fetch_weather_chunk_clips_end_date_before_request(monkeypatch) -> None:
+    request = CollectionRequest(
+        city_query="Shanghai",
+        start_year=2026,
+        end_year=2026,
+        pollutants=["pm25"],
+        include_weather=True,
+        country_code="CN",
+        weather_fields=["temp", "humidity", "wind_speed"],
+    )
+    plan = build_collection_plan(request, shanghai_candidate(), api_key=None)
+    captured: dict[str, object] = {}
+
+    def fake_get_json(url, params, timeout=45, retries=2):  # noqa: ANN001
+        del url, timeout, retries
+        captured["params"] = dict(params)
+        return {
+            "hourly": {
+                "time": ["2026-03-21T00:00"],
+                "temperature_2m": [20.0],
+                "relative_humidity_2m": [70.0],
+                "wind_speed_10m": [3.0],
+            }
+        }
+
+    monkeypatch.setattr(collection_agent, "date", type("FixedDate", (date,), {"today": classmethod(lambda cls: date(2026, 5, 5))}))
+    monkeypatch.setattr(collection_agent, "_safe_get_json", fake_get_json)
+
+    frame = fetch_weather_chunk(plan, {"start_date": "2026-03-21", "end_date": "2026-05-05"})
+
+    assert captured["params"]["start_date"] == "2026-03-21"
+    assert captured["params"]["end_date"] == "2026-04-30"
+    assert frame["temp"].iloc[0] == 20.0
 
 
 def test_normalize_local_times_drops_nonexistent_dst_hour() -> None:
@@ -570,3 +615,41 @@ def test_deepseek_chat_completion_retries_with_compat_model(monkeypatch) -> None
 
     assert attempted_models == ["deepseek-v4-flash", "deepseek-chat"]
     assert payload["choices"][0]["message"]["content"] == "ok"
+
+
+def test_safe_get_json_retries_transient_ssl_error(monkeypatch) -> None:
+    calls = {"count": 0}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"results": []}
+
+    def fake_get(url: str, params: dict[str, object], timeout: int):
+        del url, params, timeout
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise collection_agent.requests.exceptions.SSLError("unexpected eof")
+        return FakeResponse()
+
+    monkeypatch.setattr(collection_agent.requests, "get", fake_get)
+    monkeypatch.setattr(collection_agent, "sleep", lambda seconds: None)
+
+    payload = collection_agent._safe_get_json("https://example.test", params={}, timeout=1, retries=1)
+
+    assert payload == {"results": []}
+    assert calls["count"] == 2
+
+
+def test_safe_get_json_hides_low_level_network_error_after_retries(monkeypatch) -> None:
+    def fake_get(url: str, params: dict[str, object], timeout: int):
+        del url, params, timeout
+        raise collection_agent.requests.exceptions.SSLError("unexpected eof")
+
+    monkeypatch.setattr(collection_agent.requests, "get", fake_get)
+    monkeypatch.setattr(collection_agent, "sleep", lambda seconds: None)
+
+    with pytest.raises(RuntimeError, match="Open-Meteo is temporarily unavailable"):
+        collection_agent._safe_get_json("https://example.test", params={}, timeout=1, retries=1)

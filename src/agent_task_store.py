@@ -21,6 +21,16 @@ class AgentTaskStatus(StrEnum):
     TIMEOUT = "TIMEOUT"
 
 
+TERMINAL_AGENT_TASK_STATUSES = frozenset(
+    {
+        AgentTaskStatus.PLANNED,
+        AgentTaskStatus.SAVED,
+        AgentTaskStatus.FAILED,
+        AgentTaskStatus.TIMEOUT,
+    }
+)
+
+
 @dataclass(slots=True)
 class AgentTask:
     task_id: str
@@ -86,16 +96,14 @@ class InMemoryAgentTaskStore:
     ) -> AgentTask:
         with self._lock:
             task = self._tasks[task_id]
+            next_status = AgentTaskStatus(status) if status is not None else task.status
+            if task.status in TERMINAL_AGENT_TASK_STATUSES and next_status != task.status:
+                return task
             if status is not None:
-                task.status = AgentTaskStatus(status)
+                task.status = next_status
                 if task.status == AgentTaskStatus.RUNNING and task.started_at is None:
                     task.started_at = _utc_now()
-                if task.status in {
-                    AgentTaskStatus.PLANNED,
-                    AgentTaskStatus.SAVED,
-                    AgentTaskStatus.FAILED,
-                    AgentTaskStatus.TIMEOUT,
-                }:
+                if task.status in TERMINAL_AGENT_TASK_STATUSES:
                     task.finished_at = _utc_now()
             if phase is not None:
                 task.phase = phase
@@ -229,17 +237,14 @@ class PostgresAgentTaskStore:
             raise KeyError(task_id)
 
         next_status = AgentTaskStatus(status) if status is not None else current.status
+        if current.status in TERMINAL_AGENT_TASK_STATUSES and next_status != current.status:
+            return current
         started_at = current.started_at
         finished_at = current.finished_at
         now = _utc_now()
         if next_status == AgentTaskStatus.RUNNING and started_at is None:
             started_at = now
-        if next_status in {
-            AgentTaskStatus.PLANNED,
-            AgentTaskStatus.SAVED,
-            AgentTaskStatus.FAILED,
-            AgentTaskStatus.TIMEOUT,
-        }:
+        if next_status in TERMINAL_AGENT_TASK_STATUSES:
             finished_at = now
 
         with self._connect() as connection:

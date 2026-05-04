@@ -30,6 +30,7 @@ def test_custom_city_agent_labels_are_bilingual() -> None:
     assert "Task status storage" in t("agent.task_store_backend", "en", backend="Supabase Postgres")
     assert "\u672c\u5730\u5185\u5b58" in t("agent.task_store_memory", "zh-CN")
     assert "Collection plan is ready" in t("agent.task_plan_ready", "en")
+    assert "no new progress" in t("agent.task_stalled_timeout", "en", seconds=30)
 
 
 def test_weather_label_uses_translation_keys() -> None:

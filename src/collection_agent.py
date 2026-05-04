@@ -5,6 +5,7 @@ import re
 from dataclasses import asdict, dataclass
 from datetime import date, timedelta
 from pathlib import Path
+from time import sleep
 from typing import Any, Callable
 
 import pandas as pd
@@ -33,6 +34,7 @@ WEATHER_API_FIELDS = {
     "humidity": "relative_humidity_2m",
     "wind_speed": "wind_speed_10m",
 }
+OPEN_METEO_WEATHER_ARCHIVE_DELAY_DAYS = 5
 
 ProgressCallback = Callable[[int, int, str], None]
 
@@ -1110,11 +1112,16 @@ def fetch_air_quality_chunk(plan: CollectionPlan, chunk: dict[str, str]) -> pd.D
 
 
 def fetch_weather_chunk(plan: CollectionPlan, chunk: dict[str, str]) -> pd.DataFrame:
+    weather_window = weather_archive_chunk_window(chunk)
+    if weather_window is None:
+        return pd.DataFrame(columns=["timestamp", *WEATHER_API_FIELDS.keys()])
+
+    start_date, end_date = weather_window
     params = {
         "latitude": plan.latitude,
         "longitude": plan.longitude,
-        "start_date": chunk["start_date"],
-        "end_date": chunk["end_date"],
+        "start_date": start_date,
+        "end_date": end_date,
         "hourly": ",".join(plan.weather_variables),
         "timezone": plan.timezone,
     }
@@ -1129,6 +1136,21 @@ def fetch_weather_chunk(plan: CollectionPlan, chunk: dict[str, str]) -> pd.DataF
     for output_field, api_field in WEATHER_API_FIELDS.items():
         frame[output_field] = _normalize_numeric_values(hourly.get(api_field, []), length)
     return frame.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+
+
+def weather_archive_available_end(today: date | None = None) -> date:
+    current_day = today or date.today()
+    return current_day - timedelta(days=OPEN_METEO_WEATHER_ARCHIVE_DELAY_DAYS)
+
+
+def weather_archive_chunk_window(chunk: dict[str, str], today: date | None = None) -> tuple[str, str] | None:
+    start_date = date.fromisoformat(chunk["start_date"])
+    end_date = date.fromisoformat(chunk["end_date"])
+    archive_end = weather_archive_available_end(today)
+    clipped_end = min(end_date, archive_end)
+    if start_date > clipped_end:
+        return None
+    return start_date.isoformat(), clipped_end.isoformat()
 
 
 def finalize_collected_dataset(
@@ -1698,13 +1720,29 @@ def _extract_json_object(content: str) -> dict[str, Any]:
     return json.loads(stripped[start : end + 1])
 
 
-def _safe_get_json(url: str, params: dict[str, Any], timeout: int = 45) -> dict[str, Any]:
-    response = requests.get(url, params=params, timeout=timeout)
+def _safe_get_json(url: str, params: dict[str, Any], timeout: int = 45, retries: int = 2) -> dict[str, Any]:
+    last_error: requests.RequestException | None = None
+    for attempt in range(max(1, retries + 1)):
+        try:
+            response = requests.get(url, params=params, timeout=timeout)
+            break
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt >= retries:
+                raise RuntimeError(_open_meteo_unavailable_message()) from exc
+            sleep(0.25 * (attempt + 1))
+    else:
+        raise RuntimeError(_open_meteo_unavailable_message()) from last_error
+
     response.raise_for_status()
     payload = response.json()
     if payload.get("error"):
         raise ValueError(payload.get("reason") or "Unknown API error")
     return payload
+
+
+def _open_meteo_unavailable_message() -> str:
+    return "Open-Meteo 服务暂时不可用，请稍后重试。Open-Meteo is temporarily unavailable; try again shortly."
 
 
 def _normalize_local_times(values: list[Any], timezone: str) -> pd.Series:
