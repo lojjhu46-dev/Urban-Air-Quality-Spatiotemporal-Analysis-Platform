@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 import src.collection_agent as collection_agent
+import src.collection_data_pipeline as collection_data_pipeline
 from src.collection_agent import (
     CityCandidate,
     CollectionRequest,
@@ -165,6 +166,36 @@ def test_fetch_weather_chunk_clips_end_date_before_request(monkeypatch) -> None:
     assert captured["params"]["start_date"] == "2026-03-21"
     assert captured["params"]["end_date"] == "2026-04-30"
     assert frame["temp"].iloc[0] == 20.0
+
+
+def test_fetch_air_quality_chunk_uses_injected_get_json_without_mutating_pipeline(monkeypatch) -> None:
+    request = CollectionRequest(
+        city_query="Shanghai",
+        start_year=2026,
+        end_year=2026,
+        pollutants=["pm25"],
+        include_weather=False,
+        country_code="CN",
+    )
+    plan = build_collection_plan(request, shanghai_candidate(), api_key=None)
+    original_pipeline_get_json = collection_data_pipeline._safe_get_json
+
+    def fake_get_json(url, params, timeout=45, retries=2):  # noqa: ANN001
+        del url, params, timeout, retries
+        assert collection_data_pipeline._safe_get_json is original_pipeline_get_json
+        return {
+            "hourly": {
+                "time": ["2026-03-21T00:00"],
+                "pm2_5": [18.0],
+            }
+        }
+
+    monkeypatch.setattr(collection_agent, "_safe_get_json", fake_get_json)
+
+    frame = collection_agent.fetch_air_quality_chunk(plan, {"start_date": "2026-03-21", "end_date": "2026-03-21"})
+
+    assert frame["pm25"].iloc[0] == 18.0
+    assert collection_data_pipeline._safe_get_json is original_pipeline_get_json
 
 
 def test_normalize_local_times_drops_nonexistent_dst_hour() -> None:

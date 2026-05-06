@@ -1,9 +1,8 @@
 ﻿from __future__ import annotations
 
 import json
-import re
 from dataclasses import asdict, dataclass
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 from time import sleep
 from typing import Any, Callable
@@ -11,30 +10,38 @@ from typing import Any, Callable
 import pandas as pd
 import requests
 
+import src.collection_data_pipeline as collection_data_pipeline
+import src.collection_agent_summary as collection_agent_summary
+import src.custom_city_validation as custom_city_validation
+import src.deepseek_client as deepseek_client
 from src.config import (
     AQ_AGENT_CHUNK_DAYS,
     AQ_AGENT_DEFAULT_MODEL,
     AQ_AGENT_OUTPUT_DIR,
     AQ_AGENT_POLLUTANTS,
-    CAMS_EUROPE_START_DATE,
     DEEPSEEK_BASE_URL,
     EUROPE_COUNTRY_CODES,
-    OPEN_METEO_AIR_QUALITY_URL,
     OPEN_METEO_GEOCODING_URL,
-    OPEN_METEO_GLOBAL_START_DATE,
-    OPEN_METEO_WEATHER_ARCHIVE_URL,
-    POLLUTANT_COLUMNS,
 )
 from src.agent_interaction import china_province_city_names, resolve_china_catalog_province
-from src.data import output_dataset_path, write_dataset as write_tabular_dataset
 from src.i18n import t
-
-WEATHER_API_FIELDS = {
-    "temp": "temperature_2m",
-    "humidity": "relative_humidity_2m",
-    "wind_speed": "wind_speed_10m",
-}
-OPEN_METEO_WEATHER_ARCHIVE_DELAY_DAYS = 5
+from src.collection_data_pipeline import (
+    WEATHER_API_FIELDS,
+    _concat_unique_frames,
+    _normalize_local_times,
+    _normalize_numeric_values,
+    _open_meteo_unavailable_message,
+    build_output_path,
+    chunk_date_range,
+    finalize_collected_dataset,
+    resolve_supported_window,
+    save_dataset,
+    slugify,
+    summarize_dataset_coverage,
+    weather_archive_available_end,
+    weather_archive_chunk_window,
+)
+from src.custom_city_validation import CustomCityValidationResult
 
 ProgressCallback = Callable[[int, int, str], None]
 
@@ -175,21 +182,6 @@ class ToolCallingAgentResult:
     state: ToolCallingAgentState
 
 
-@dataclass(slots=True)
-class CustomCityValidationResult:
-    input_country: str
-    input_city: str
-    status: str
-    corrected_country: str | None
-    corrected_city: str | None
-    country_code: str | None
-    matching_countries: list[str]
-    message: str
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
 def city_candidate_from_dict(data: dict[str, Any]) -> CityCandidate:
     return CityCandidate(**data)
 
@@ -199,16 +191,7 @@ def collection_plan_from_dict(data: dict[str, Any]) -> CollectionPlan:
 
 
 def custom_city_validation_from_dict(data: dict[str, Any]) -> CustomCityValidationResult:
-    return CustomCityValidationResult(
-        input_country=str(data.get("input_country") or ""),
-        input_city=str(data.get("input_city") or ""),
-        status=_normalize_custom_city_status(data.get("status"), data.get("message")),
-        corrected_country=str(data.get("corrected_country") or "") or None,
-        corrected_city=str(data.get("corrected_city") or "") or None,
-        country_code=_normalize_country_code(data.get("country_code")),
-        matching_countries=[str(item) for item in list(data.get("matching_countries") or []) if str(item).strip()],
-        message=str(data.get("message") or ""),
-    )
+    return custom_city_validation.custom_city_validation_from_dict(data)
 
 
 def validate_custom_city_with_deepseek(
@@ -258,39 +241,7 @@ def validate_custom_city_with_deepseek(
     if not data:
         raise ValueError(t("agent.custom_city_validation_unavailable", language))
 
-    corrected_country = str(data.get("corrected_country") or "").strip() or None
-    corrected_city = str(data.get("corrected_city") or "").strip() or None
-    country_code = _normalize_country_code(data.get("country_code"))
-    matching_countries = _unique_strings(
-        [str(item).strip() for item in list(data.get("matching_countries") or []) if str(item).strip()]
-    )
-    message = str(data.get("message") or "").strip()
-    if not message:
-        message = t("agent.custom_city_validated", language, city=corrected_city or clean_city, country=corrected_country or clean_country)
-    status = _normalize_custom_city_status(data.get("status"), message)
-
-    if status == "valid":
-        corrected_country = corrected_country or clean_country
-        corrected_city = corrected_city or clean_city
-
-    if status == "valid" and (not corrected_city or not corrected_country):
-        status = "needs_confirmation" if matching_countries else "low_confidence"
-    if status == "valid":
-        country_changed = corrected_country and _normalize_location_key(corrected_country) != _normalize_location_key(clean_country)
-        city_changed = corrected_city and _normalize_location_key(corrected_city) != _normalize_location_key(clean_city)
-        if country_changed or city_changed or len(matching_countries) > 1:
-            status = "needs_confirmation"
-
-    return CustomCityValidationResult(
-        input_country=clean_country,
-        input_city=clean_city,
-        status=status,
-        corrected_country=corrected_country,
-        corrected_city=corrected_city,
-        country_code=country_code,
-        matching_countries=matching_countries,
-        message=message,
-    )
+    return custom_city_validation.custom_city_validation_from_model_response(clean_country, clean_city, data, language=language)
 
 
 def search_city_candidates(
@@ -1024,206 +975,24 @@ def _collect_proxy_candidate(
     return proxy_plan, proxy_df, proxy_warnings, proxy_coverage
 
 
-def resolve_supported_window(
-    candidate: CityCandidate,
-    requested_start: date,
-    requested_end: date,
-    today: date | None = None,
-    language: str = "en",
-) -> tuple[date, date, str, str, list[str]]:
-    current_day = today or date.today()
-    warnings: list[str] = []
-
-    if candidate.is_europe:
-        supported_start = date.fromisoformat(CAMS_EUROPE_START_DATE)
-        source_domain = "cams_europe"
-        sampling_step = "hourly"
-    else:
-        supported_start = date.fromisoformat(OPEN_METEO_GLOBAL_START_DATE)
-        source_domain = "auto"
-        sampling_step = "3-hourly"
-
-    actual_start = max(requested_start, supported_start)
-    actual_end = min(requested_end, current_day)
-
-    if requested_start < supported_start:
-        warnings.append(t("collection.clipped_start", language, date=supported_start.isoformat()))
-    if requested_end > current_day:
-        warnings.append(t("collection.clipped_end", language, date=current_day.isoformat()))
-
-    return actual_start, actual_end, source_domain, sampling_step, warnings
-
-
-def chunk_date_range(start_date: date, end_date: date, chunk_days: int = AQ_AGENT_CHUNK_DAYS) -> list[dict[str, str]]:
-    if start_date > end_date:
-        return []
-
-    chunks: list[dict[str, str]] = []
-    current = start_date
-    while current <= end_date:
-        chunk_end = min(current + timedelta(days=max(chunk_days, 1) - 1), end_date)
-        chunks.append(
-            {
-                "start_date": current.isoformat(),
-                "end_date": chunk_end.isoformat(),
-            }
-        )
-        current = chunk_end + timedelta(days=1)
-    return chunks
-
-
-def build_output_path(
-    output_dir: Path,
-    candidate: CityCandidate,
-    start_date: date,
-    end_date: date,
-) -> Path:
-    slug = slugify(candidate.name)
-    if not slug:
-        if candidate.open_meteo_id:
-            slug = f"city-{candidate.open_meteo_id}"
-        else:
-            slug = f"city-{candidate.country_code.lower()}"
-    filename = f"{slug}_{start_date.year}_{end_date.year}_aq.parquet"
-    return output_dataset_path(output_dir / filename)
-
-
 def fetch_air_quality_chunk(plan: CollectionPlan, chunk: dict[str, str]) -> pd.DataFrame:
-    params = {
-        "latitude": plan.latitude,
-        "longitude": plan.longitude,
-        "hourly": ",".join(plan.pollutant_variables),
-        "start_date": chunk["start_date"],
-        "end_date": chunk["end_date"],
-        "timezone": plan.timezone,
-        "domains": plan.source_domain,
-    }
-    payload = _safe_get_json(OPEN_METEO_AIR_QUALITY_URL, params=params, timeout=60)
-    hourly = payload.get("hourly") or {}
-    times = hourly.get("time") or []
-    if not times:
-        return pd.DataFrame(columns=["timestamp", *plan.pollutants])
-
-    length = len(times)
-    frame = pd.DataFrame({"timestamp": _normalize_local_times(times, plan.timezone)})
-    for pollutant, api_field in zip(plan.pollutants, plan.pollutant_variables, strict=False):
-        frame[pollutant] = _normalize_numeric_values(hourly.get(api_field, []), length)
-    return frame.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    return collection_data_pipeline.fetch_air_quality_chunk(plan, chunk, get_json=_safe_get_json)
 
 
 def fetch_weather_chunk(plan: CollectionPlan, chunk: dict[str, str]) -> pd.DataFrame:
-    weather_window = weather_archive_chunk_window(chunk)
-    if weather_window is None:
-        return pd.DataFrame(columns=["timestamp", *WEATHER_API_FIELDS.keys()])
-
-    start_date, end_date = weather_window
-    params = {
-        "latitude": plan.latitude,
-        "longitude": plan.longitude,
-        "start_date": start_date,
-        "end_date": end_date,
-        "hourly": ",".join(plan.weather_variables),
-        "timezone": plan.timezone,
-    }
-    payload = _safe_get_json(OPEN_METEO_WEATHER_ARCHIVE_URL, params=params, timeout=60)
-    hourly = payload.get("hourly") or {}
-    times = hourly.get("time") or []
-    if not times:
-        return pd.DataFrame(columns=["timestamp", *WEATHER_API_FIELDS.keys()])
-
-    length = len(times)
-    frame = pd.DataFrame({"timestamp": _normalize_local_times(times, plan.timezone)})
-    for output_field, api_field in WEATHER_API_FIELDS.items():
-        frame[output_field] = _normalize_numeric_values(hourly.get(api_field, []), length)
-    return frame.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    return collection_data_pipeline.fetch_weather_chunk(plan, chunk, get_json=_safe_get_json, today=date.today())
 
 
-def weather_archive_available_end(today: date | None = None) -> date:
-    current_day = today or date.today()
-    return current_day - timedelta(days=OPEN_METEO_WEATHER_ARCHIVE_DELAY_DAYS)
-
-
-def weather_archive_chunk_window(chunk: dict[str, str], today: date | None = None) -> tuple[str, str] | None:
-    start_date = date.fromisoformat(chunk["start_date"])
-    end_date = date.fromisoformat(chunk["end_date"])
-    archive_end = weather_archive_available_end(today)
-    clipped_end = min(end_date, archive_end)
-    if start_date > clipped_end:
-        return None
-    return start_date.isoformat(), clipped_end.isoformat()
-
-
-def finalize_collected_dataset(
-    air_quality_df: pd.DataFrame,
-    weather_df: pd.DataFrame,
-    station_name: str,
-    latitude: float,
-    longitude: float,
-) -> pd.DataFrame:
-    merged = air_quality_df.copy()
-    if not weather_df.empty:
-        merged = merged.merge(weather_df, on="timestamp", how="left")
-
-    merged["station_id"] = station_name
-    merged["lat"] = latitude
-    merged["lon"] = longitude
-
-    for pollutant in POLLUTANT_COLUMNS:
-        if pollutant not in merged.columns:
-            merged[pollutant] = pd.NA
-        merged[pollutant] = pd.to_numeric(merged[pollutant], errors="coerce")
-
-    for weather_col in WEATHER_API_FIELDS:
-        if weather_col not in merged.columns:
-            merged[weather_col] = pd.NA
-        merged[weather_col] = pd.to_numeric(merged[weather_col], errors="coerce")
-
-    for pollutant in POLLUTANT_COLUMNS:
-        series = merged[pollutant]
-        quantiles = series.dropna()
-        if quantiles.empty:
-            merged[f"{pollutant}_viz"] = series
-        else:
-            lower = quantiles.quantile(0.01)
-            upper = quantiles.quantile(0.99)
-            merged[f"{pollutant}_viz"] = series.clip(lower, upper)
-
-    keep = [
-        "timestamp",
-        "station_id",
-        "lat",
-        "lon",
-        *POLLUTANT_COLUMNS,
-        *WEATHER_API_FIELDS.keys(),
-        *[f"{pollutant}_viz" for pollutant in POLLUTANT_COLUMNS],
-    ]
-    out = (
-        merged[keep]
-        .drop_duplicates(subset=["timestamp", "station_id"], keep="last")
-        .sort_values(["timestamp", "station_id"])
-        .reset_index(drop=True)
-    )
-    return out
-
-
-def save_dataset(df: pd.DataFrame, output_path: Path) -> Path:
-    return write_tabular_dataset(df, output_path)
-
-
-def summarize_dataset_coverage(df: pd.DataFrame, pollutants: list[str]) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for pollutant in pollutants:
-        if pollutant not in df.columns:
-            continue
-        non_null_ratio = float(df[pollutant].notna().mean()) if len(df) else 0.0
-        rows.append(
-            {
-                "pollutant": pollutant,
-                "non_null_ratio": round(non_null_ratio, 4),
-                "rows_with_values": int(df[pollutant].notna().sum()),
-            }
-        )
-    return rows
+def _safe_get_json(url: str, params: dict[str, Any], timeout: int = 45, retries: int = 2) -> dict[str, Any]:
+    original_requests = collection_data_pipeline.requests
+    original_sleep = collection_data_pipeline.sleep
+    collection_data_pipeline.requests = requests
+    collection_data_pipeline.sleep = sleep
+    try:
+        return collection_data_pipeline._safe_get_json(url, params, timeout=timeout, retries=retries)
+    finally:
+        collection_data_pipeline.requests = original_requests
+        collection_data_pipeline.sleep = original_sleep
 
 
 def _has_usable_coverage_rows(rows: list[dict[str, Any]]) -> bool:
@@ -1326,22 +1095,7 @@ def generate_collection_summary(
         base_url=base_url,
         language=language,
     )
-    if not summary_data:
-        return deterministic_summary, "deterministic"
-
-    llm_summary = str(summary_data.get("summary") or "").strip()
-    caveat = str(summary_data.get("caveat") or "").strip()
-    if caveat:
-        llm_summary = " ".join(part for part in [llm_summary, caveat] if part).strip()
-    if not llm_summary:
-        llm_summary = deterministic_summary
-    return llm_summary, model
-
-
-def slugify(value: str) -> str:
-    lowered = value.strip().lower()
-    slug = re.sub(r"[^a-z0-9]+", "-", lowered)
-    return slug.strip("-")
+    return collection_agent_summary.merge_run_summary(deterministic_summary, summary_data, model)
 
 
 def _default_planner_notes(
@@ -1351,20 +1105,7 @@ def _default_planner_notes(
     weather_fields: list[str],
     language: str = "en",
 ) -> str:
-    weather_note = (
-        t("collection.weather_with_fields", language, fields=", ".join(field.lower() for field in weather_fields))
-        if weather_fields
-        else t("collection.weather_without", language)
-    )
-    pollutants_text = ", ".join(pollutant.upper() for pollutant in pollutants)
-    return t(
-        "collection.default_planner_notes",
-        language,
-        city=candidate.display_name,
-        chunks=len(chunks),
-        pollutants=pollutants_text,
-        weather_clause=weather_note,
-    )
+    return collection_agent_summary.default_planner_notes(candidate, pollutants, chunks, weather_fields, language=language)
 
 
 def _default_run_summary(
@@ -1374,22 +1115,7 @@ def _default_run_summary(
     runtime_warnings: list[str],
     language: str = "en",
 ) -> str:
-    coverage_text = ", ".join(
-        f"{row['pollutant'].upper()} {row['non_null_ratio']:.0%}" for row in coverage_rows
-    )
-    warning_text = t("collection.summary_warnings", language, warnings='; '.join(runtime_warnings)) if runtime_warnings else ""
-    return t(
-        "collection.default_summary",
-        language,
-        city=plan.city_label,
-        rows=len(df),
-        start=plan.actual_start_date,
-        end=plan.actual_end_date,
-        sampling=plan.sampling_step,
-        coverage=coverage_text,
-        path=plan.output_path,
-        warnings=warning_text,
-    )
+    return collection_agent_summary.default_run_summary(df, plan, coverage_rows, runtime_warnings, language=language)
 
 
 def _tool_calling_system_prompt(allow_run_collection: bool, language: str = "en") -> str:
@@ -1528,26 +1254,14 @@ def _generate_planner_guidance(
     base_url: str,
     language: str = "en",
 ) -> dict[str, Any] | None:
-    reply_language = "Simplified Chinese" if language == "zh-CN" else "English"
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a data collection planner for an air-quality dashboard. "
-                "Return JSON only and never claim data exists outside the provided source window. "
-                f"Write planner_notes, quality_checks, and risk_flags in {reply_language}."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                "Create a concise execution brief for this collection plan. "
-                "Return a JSON object with keys planner_notes, quality_checks, risk_flags.\n"
-                f"Plan: {json.dumps(plan.to_dict(), ensure_ascii=False)}"
-            ),
-        },
-    ]
-    return _deepseek_json_completion(messages, api_key=api_key, model=model, base_url=base_url, timeout=90)
+    return collection_agent_summary.generate_planner_guidance(
+        plan,
+        api_key,
+        model,
+        base_url,
+        json_completion=_json_completion_for_summary,
+        language=language,
+    )
 
 
 def _generate_run_summary(
@@ -1560,30 +1274,27 @@ def _generate_run_summary(
     base_url: str,
     language: str = "en",
 ) -> dict[str, Any] | None:
-    reply_language = "Simplified Chinese" if language == "zh-CN" else "English"
-    preview = {
-        "city": plan.city_label,
-        "range": [plan.actual_start_date, plan.actual_end_date],
-        "rows": len(df),
-        "sampling_step": plan.sampling_step,
-        "coverage_rows": coverage_rows,
-        "warnings": runtime_warnings,
-    }
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You summarize completed air-quality data collection runs. "
-                "Return JSON only with keys summary and caveat. "
-                f"Write both fields in {reply_language}."
-            ),
-        },
-        {
-            "role": "user",
-            "content": f"Summarize this run in 2 sentences max: {json.dumps(preview, ensure_ascii=False)}",
-        },
-    ]
-    return _deepseek_json_completion(messages, api_key=api_key, model=model, base_url=base_url, timeout=90)
+    return collection_agent_summary.generate_run_summary(
+        df,
+        plan,
+        coverage_rows,
+        runtime_warnings,
+        api_key,
+        model,
+        base_url,
+        json_completion=_json_completion_for_summary,
+        language=language,
+    )
+
+
+def _json_completion_for_summary(
+    messages: list[dict[str, Any]],
+    api_key: str,
+    model: str,
+    base_url: str,
+    timeout: int,
+) -> dict[str, Any] | None:
+    return _deepseek_json_completion(messages, api_key=api_key, model=model, base_url=base_url, timeout=timeout)
 
 
 def _deepseek_json_completion(
@@ -1593,51 +1304,22 @@ def _deepseek_json_completion(
     base_url: str,
     timeout: int = 90,
 ) -> dict[str, Any] | None:
-    payload = _deepseek_chat_completion(
+    return deepseek_client.deepseek_json_completion(
         messages,
         api_key=api_key,
         model=model,
         base_url=base_url,
-        temperature=0.1,
         timeout=timeout,
-        thinking_type="disabled",
+        chat_completion=_deepseek_chat_completion,
     )
-    choices = payload.get("choices") or []
-    if not choices:
-        return None
-    message = choices[0].get("message") or {}
-    content = message.get("content") or ""
-    if not content:
-        return None
-    try:
-        return _extract_json_object(str(content))
-    except Exception:  # noqa: BLE001
-        return None
 
 
 def _deepseek_model_candidates(model: str) -> list[str]:
-    candidates = [model]
-    if model == "deepseek-v4-flash":
-        candidates.append("deepseek-chat")
-    return candidates
+    return deepseek_client.deepseek_model_candidates(model)
 
 
 def _deepseek_http_error(response: requests.Response, exc: requests.HTTPError, model: str) -> requests.HTTPError:
-    detail = ""
-    try:
-        body = response.json()
-    except Exception:  # noqa: BLE001
-        body = response.text.strip()
-    if isinstance(body, dict):
-        raw_error = body.get("error") or body.get("message") or body.get("reason") or body
-        detail = raw_error if isinstance(raw_error, str) else json.dumps(raw_error, ensure_ascii=False)
-    else:
-        detail = str(body).strip()
-
-    message = f"{exc}. Model: {model}"
-    if detail:
-        message = f"{message}. Response: {detail}"
-    return requests.HTTPError(message, response=response)
+    return deepseek_client.deepseek_http_error(response, exc, model)
 
 
 def _deepseek_chat_completion(
@@ -1652,122 +1334,28 @@ def _deepseek_chat_completion(
     timeout: int = 90,
     thinking_type: str | None = None,
 ) -> dict[str, Any]:
-    endpoint = f"{base_url.rstrip('/')}/chat/completions"
-    candidates = _deepseek_model_candidates(model)
-    last_error: requests.HTTPError | None = None
-
-    for idx, candidate_model in enumerate(candidates):
-        payload: dict[str, Any] = {
-            "model": candidate_model,
-            "messages": messages,
-            "stream": False,
-            "temperature": temperature,
-        }
-        if tools is not None:
-            payload["tools"] = tools
-        if tool_choice is not None:
-            payload["tool_choice"] = tool_choice
-        if thinking_type is not None:
-            payload["thinking"] = {"type": thinking_type}
-
-        response = requests.post(
-            endpoint,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=timeout,
-        )
-        try:
-            response.raise_for_status()
-        except requests.HTTPError as exc:
-            wrapped = _deepseek_http_error(response, exc, candidate_model)
-            last_error = wrapped
-            is_last_candidate = idx == len(candidates) - 1
-            if response.status_code == 400 and not is_last_candidate:
-                continue
-            raise wrapped from exc
-        return response.json()
-
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError("DeepSeek request failed before a response was returned.")
+    return deepseek_client.deepseek_chat_completion(
+        messages,
+        api_key=api_key,
+        model=model,
+        base_url=base_url,
+        tools=tools,
+        tool_choice=tool_choice,
+        temperature=temperature,
+        timeout=timeout,
+        thinking_type=thinking_type,
+        post=requests.post,
+        model_candidates=_deepseek_model_candidates,
+        http_error_factory=_deepseek_http_error,
+    )
 
 
 def _coerce_tool_arguments(raw_arguments: str | dict[str, Any]) -> dict[str, Any]:
-    if isinstance(raw_arguments, dict):
-        return raw_arguments
-
-    text = str(raw_arguments or "").strip()
-    if not text:
-        return {}
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return _extract_json_object(text)
+    return deepseek_client.coerce_tool_arguments(raw_arguments)
 
 
 def _extract_json_object(content: str) -> dict[str, Any]:
-    stripped = content.strip()
-    if stripped.startswith("```"):
-        stripped = stripped.strip("`")
-        stripped = stripped.replace("json", "", 1).strip()
-    start = stripped.find("{")
-    end = stripped.rfind("}")
-    if start < 0 or end < 0 or end <= start:
-        raise ValueError("JSON object not found in model response.")
-    return json.loads(stripped[start : end + 1])
-
-
-def _safe_get_json(url: str, params: dict[str, Any], timeout: int = 45, retries: int = 2) -> dict[str, Any]:
-    last_error: requests.RequestException | None = None
-    for attempt in range(max(1, retries + 1)):
-        try:
-            response = requests.get(url, params=params, timeout=timeout)
-            break
-        except requests.RequestException as exc:
-            last_error = exc
-            if attempt >= retries:
-                raise RuntimeError(_open_meteo_unavailable_message()) from exc
-            sleep(0.25 * (attempt + 1))
-    else:
-        raise RuntimeError(_open_meteo_unavailable_message()) from last_error
-
-    response.raise_for_status()
-    payload = response.json()
-    if payload.get("error"):
-        raise ValueError(payload.get("reason") or "Unknown API error")
-    return payload
-
-
-def _open_meteo_unavailable_message() -> str:
-    return "Open-Meteo 服务暂时不可用，请稍后重试。Open-Meteo is temporarily unavailable; try again shortly."
-
-
-def _normalize_local_times(values: list[Any], timezone: str) -> pd.Series:
-    ts = pd.to_datetime(pd.Series(values), errors="coerce")
-    if ts.dt.tz is None:
-        # Open-Meteo returns local wall-clock timestamps. Around DST transitions,
-        # some local times do not exist or are ambiguous, so coerce them to NaT
-        # and let chunk loaders drop those rows instead of crashing the run.
-        return ts.dt.tz_localize(timezone, ambiguous="NaT", nonexistent="NaT")
-    return ts.dt.tz_convert(timezone)
-
-
-def _normalize_numeric_values(values: list[Any], length: int) -> pd.Series:
-    series = pd.Series(values, dtype="object")
-    numeric = pd.to_numeric(series, errors="coerce")
-    return numeric.reindex(range(length))
-
-
-def _concat_unique_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
-    if not frames:
-        return pd.DataFrame()
-    merged = pd.concat(frames, ignore_index=True)
-    if "timestamp" not in merged.columns:
-        return merged
-    return merged.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True)
+    return deepseek_client.extract_json_object(content)
 
 
 def _notify(callback: ProgressCallback | None, step: int, total_steps: int, message: str) -> None:
@@ -1776,57 +1364,18 @@ def _notify(callback: ProgressCallback | None, step: int, total_steps: int, mess
 
 
 def _unique_strings(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    output: list[str] = []
-    for value in values:
-        text = str(value).strip()
-        if not text or text in seen:
-            continue
-        output.append(text)
-        seen.add(text)
-    return output
+    return custom_city_validation.unique_strings(values)
 
 
 def _normalize_custom_city_status(raw_status: Any, message: Any = None) -> str:
-    text = f"{raw_status or ''} {message or ''}".strip().lower()
-    compact = re.sub(r"[\s_\-]+", "", text)
-    if not compact:
-        return "low_confidence"
-    if compact in {"valid", "needsconfirmation", "lowconfidence"}:
-        return {"valid": "valid", "needsconfirmation": "needs_confirmation", "lowconfidence": "low_confidence"}[compact]
-    if any(token in text for token in ("low confidence", "invalid", "not valid")) or any(
-        token in compact for token in ("\u4f4e\u7f6e\u4fe1", "\u7f6e\u4fe1\u5ea6\u4f4e", "\u65e0\u6548", "\u4e0d\u786e\u5b9a", "\u4e0d\u5339\u914d")
-    ):
-        return "low_confidence"
-    if any(
-        token in compact
-        for token in (
-            "needsconfirmation",
-            "requiresconfirmation",
-            "confirmationrequired",
-            "pleaseconfirm",
-            "confirmcountry",
-            "ambiguous",
-            "\u9700\u786e\u8ba4",
-            "\u9700\u8981\u786e\u8ba4",
-            "\u91cd\u540d",
-            "\u591a\u4e2a",
-        )
-    ):
-        return "needs_confirmation"
-    if any(token in compact for token in ("valid", "correct", "\u6709\u6548", "\u6b63\u786e", "\u9a8c\u8bc1\u6210\u529f")):
-        return "valid"
-    return "low_confidence"
+    return custom_city_validation.normalize_custom_city_status(raw_status, message)
 
 
 def _normalize_country_code(value: Any) -> str | None:
-    text = str(value or "").strip().upper()
-    return text or None
+    return custom_city_validation.normalize_country_code(value)
 
 
 def _normalize_location_key(value: Any) -> str:
-    lowered = str(value or "").strip().lower()
-    collapsed = re.sub(r"[^a-z0-9]+", "", lowered)
-    return collapsed.replace("province", "").replace("city", "")
+    return custom_city_validation.normalize_location_key(value)
 
 
