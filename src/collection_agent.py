@@ -12,6 +12,7 @@ import requests
 
 import src.collection_data_pipeline as collection_data_pipeline
 import src.collection_agent_summary as collection_agent_summary
+import src.collection_agent_tools as collection_agent_tools
 import src.custom_city_validation as custom_city_validation
 import src.deepseek_client as deepseek_client
 from src.config import (
@@ -301,109 +302,11 @@ def search_city_candidates(
 
 
 def get_collection_agent_tool_schemas(include_run_collection: bool = True) -> list[dict[str, Any]]:
-    pollutant_keys = sorted(AQ_AGENT_POLLUTANTS)
-    weather_keys = sorted(WEATHER_API_FIELDS)
-
-    search_tool = {
-        "type": "function",
-        "function": {
-            "name": "search_city_candidates",
-            "description": "Search matching city candidates before planning or collecting data.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "City name or city phrase to resolve, such as Beijing or Los Angeles.",
-                    },
-                    "country_code": {
-                        "type": "string",
-                        "description": "Optional ISO-3166 alpha-2 country code such as CN, US, or DE.",
-                    },
-                    "count": {
-                        "type": "integer",
-                        "description": "How many candidate matches to return.",
-                        "minimum": 1,
-                        "maximum": 10,
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    }
-
-    plan_tool = {
-        "type": "function",
-        "function": {
-            "name": "build_collection_plan",
-            "description": "Create a deterministic historical air-quality collection plan for a city candidate.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "city_query": {"type": "string", "description": "City name to collect."},
-                    "country_code": {"type": "string", "description": "Optional ISO-3166 alpha-2 country code."},
-                    "start_year": {"type": "integer", "minimum": 2013},
-                    "end_year": {"type": "integer", "minimum": 2013},
-                    "pollutants": {
-                        "type": "array",
-                        "items": {"type": "string", "enum": pollutant_keys},
-                        "minItems": 1,
-                    },
-                    "include_weather": {"type": "boolean", "description": "Whether to enrich with weather columns."},
-                    "weather_fields": {
-                        "type": "array",
-                        "items": {"type": "string", "enum": weather_keys},
-                        "description": "Optional subset of weather fields to include when include_weather is true.",
-                    },
-                    "candidate_index": {
-                        "type": "integer",
-                        "description": "Index from the last city search result to use as the resolved city candidate.",
-                        "minimum": 0,
-                    },
-                },
-                "required": ["city_query", "start_year", "end_year", "pollutants"],
-            },
-        },
-    }
-
-    tools = [search_tool, plan_tool]
-    if include_run_collection:
-        tools.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": "run_collection",
-                    "description": "Execute the planned data collection and save a parquet dataset.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "city_query": {"type": "string", "description": "City name to collect."},
-                            "country_code": {"type": "string", "description": "Optional ISO-3166 alpha-2 country code."},
-                            "start_year": {"type": "integer", "minimum": 2013},
-                            "end_year": {"type": "integer", "minimum": 2013},
-                            "pollutants": {
-                                "type": "array",
-                                "items": {"type": "string", "enum": pollutant_keys},
-                                "minItems": 1,
-                            },
-                            "include_weather": {"type": "boolean", "description": "Whether to enrich with weather columns."},
-                            "weather_fields": {
-                                "type": "array",
-                                "items": {"type": "string", "enum": weather_keys},
-                                "description": "Optional subset of weather fields to include when include_weather is true.",
-                            },
-                            "candidate_index": {
-                                "type": "integer",
-                                "description": "Index from the last city search result to use as the resolved city candidate.",
-                                "minimum": 0,
-                            },
-                        },
-                        "required": ["city_query", "start_year", "end_year", "pollutants"],
-                    },
-                },
-            }
-        )
-    return tools
+    return collection_agent_tools.get_collection_agent_tool_schemas(
+        pollutant_keys=list(AQ_AGENT_POLLUTANTS),
+        weather_keys=list(WEATHER_API_FIELDS),
+        include_run_collection=include_run_collection,
+    )
 
 
 def execute_collection_agent_tool(
@@ -416,80 +319,25 @@ def execute_collection_agent_tool(
     search_language: str = "en",
     language: str = "en",
 ) -> dict[str, Any]:
-    arguments = _coerce_tool_arguments(raw_arguments)
-
-    if name == "search_city_candidates":
-        query = str(arguments.get("query") or "").strip()
-        country_code = _normalize_country_code(arguments.get("country_code"))
-        count = int(arguments.get("count", 5))
-        candidates = search_city_candidates(query, country_code=country_code, count=count, language=search_language)
-        state.last_candidates = candidates
-        state.last_search_query = query
-        state.last_country_code = country_code
-        return {
-            "query": query,
-            "country_code": country_code,
-            "candidate_count": len(candidates),
-            "candidates": [_candidate_payload(candidate, index) for index, candidate in enumerate(candidates)],
-        }
-
-    if name == "build_collection_plan":
-        request = _collection_request_from_tool_arguments(arguments)
-        candidate_index = int(arguments.get("candidate_index", 0))
-        candidate, candidates = _resolve_candidate_for_tool(
-            request,
-            candidate_index=candidate_index,
-            state=state,
-            search_language=search_language,
-        )
-        plan = build_collection_plan(request, candidate, api_key=None, output_dir=output_dir, language=language)
-        state.last_plan = plan
-        return {
-            "selected_candidate": _candidate_payload(candidate, candidate_index),
-            "candidate_count": len(candidates),
-            "plan": plan.to_dict(),
-        }
-
-    if name == "run_collection":
-        request = _collection_request_from_tool_arguments(arguments)
-        candidate_index = int(arguments.get("candidate_index", 0))
-        candidate, candidates = _resolve_candidate_for_tool(
-            request,
-            candidate_index=candidate_index,
-            state=state,
-            search_language=search_language,
-        )
-        result = run_collection_agent(
-            request,
-            candidate,
-            api_key=None,
-            output_dir=output_dir,
-            progress_callback=progress_callback,
-            language=language,
-        )
-        state.last_plan = result.plan
-        state.last_result = result
-        return {
-            "selected_candidate": _candidate_payload(candidate, candidate_index),
-            "candidate_count": len(candidates),
-            "plan": result.plan.to_dict(),
-            "collection_result": _collection_result_payload(result),
-        }
-
-    raise ValueError(f"Unsupported agent tool: {name}")
+    return collection_agent_tools.execute_collection_agent_tool(
+        name,
+        raw_arguments,
+        state=state,
+        progress_callback=progress_callback,
+        output_dir=output_dir,
+        search_language=search_language,
+        language=language,
+        coerce_tool_arguments=_coerce_tool_arguments,
+        normalize_country_code=_normalize_country_code,
+        request_factory=CollectionRequest,
+        search_fn=search_city_candidates,
+        build_plan_fn=build_collection_plan,
+        run_collection_fn=run_collection_agent,
+    )
 
 
 def _default_request_tool_arguments(default_request: CollectionRequest) -> dict[str, Any]:
-    return {
-        "city_query": default_request.city_query,
-        "country_code": default_request.country_code,
-        "start_year": default_request.start_year,
-        "end_year": default_request.end_year,
-        "pollutants": default_request.normalized_pollutants(),
-        "include_weather": default_request.include_weather,
-        "weather_fields": default_request.normalized_weather_fields(),
-        "candidate_index": 0,
-    }
+    return collection_agent_tools.default_request_tool_arguments(default_request)
 
 
 def _execute_default_request_tool_flow(
@@ -503,34 +351,17 @@ def _execute_default_request_tool_flow(
     search_language: str,
     language: str,
 ) -> None:
-    search_arguments = {
-        "query": default_request.city_query,
-        "country_code": default_request.country_code,
-        "count": 5,
-    }
-    search_output = execute_collection_agent_tool(
-        "search_city_candidates",
-        search_arguments,
+    collection_agent_tools.execute_default_request_tool_flow(
+        default_request,
+        allow_run_collection=allow_run_collection,
         state=state,
+        tool_trace=tool_trace,
+        execute_tool=execute_collection_agent_tool,
         progress_callback=progress_callback,
         output_dir=output_dir,
         search_language=search_language,
         language=language,
     )
-    tool_trace.append({"tool": "search_city_candidates", "arguments": search_arguments, "result": search_output})
-
-    tool_name = "run_collection" if allow_run_collection else "build_collection_plan"
-    tool_arguments = _default_request_tool_arguments(default_request)
-    tool_output = execute_collection_agent_tool(
-        tool_name,
-        tool_arguments,
-        state=state,
-        progress_callback=progress_callback,
-        output_dir=output_dir,
-        search_language=search_language,
-        language=language,
-    )
-    tool_trace.append({"tool": tool_name, "arguments": tool_arguments, "result": tool_output})
 
 
 def run_deepseek_tool_agent(
@@ -587,9 +418,10 @@ def run_deepseek_tool_agent(
 
         tool_calls = assistant_message.get("tool_calls") or []
         if not tool_calls:
-            if default_request is not None and (
-                (allow_run_collection and state.last_result is None)
-                or (not allow_run_collection and state.last_plan is None)
+            if collection_agent_tools.should_execute_default_request_flow(
+                default_request=default_request,
+                allow_run_collection=allow_run_collection,
+                state=state,
             ):
                 _execute_default_request_tool_flow(
                     default_request,
@@ -631,9 +463,10 @@ def run_deepseek_tool_agent(
                 }
             )
 
-    if default_request is not None and (
-        (allow_run_collection and state.last_result is None)
-        or (not allow_run_collection and state.last_plan is None)
+    if collection_agent_tools.should_execute_default_request_flow(
+        default_request=default_request,
+        allow_run_collection=allow_run_collection,
+        state=state,
     ):
         _execute_default_request_tool_flow(
             default_request,
@@ -1119,54 +952,22 @@ def _default_run_summary(
 
 
 def _tool_calling_system_prompt(allow_run_collection: bool, language: str = "en") -> str:
-    run_rule = (
-        "You may execute the collection once the request is specific and a city candidate is resolved."
-        if allow_run_collection
-        else "Do not run data collection; stop after building the plan and explaining it."
-    )
-    reply_language = "Simplified Chinese" if language == "zh-CN" else "English"
-    pollutant_keys = ", ".join(sorted(AQ_AGENT_POLLUTANTS))
-    return (
-        "You are an air-quality data collection agent embedded in a Streamlit app. "
-        "Use tool calls to search cities, build a deterministic collection plan, and optionally run collection. "
-        f"Allowed pollutant keys are: {pollutant_keys}. "
-        "Search for city candidates first when the target city may be ambiguous. "
-        "When multiple candidates exist, prefer the most likely major-city match unless the user specifies otherwise. "
-        "Never claim historical coverage outside the dates returned by the planning tool. "
-        f"{run_rule} After finishing tool use, reply with a concise user-facing summary in {reply_language}."
+    return collection_agent_tools.tool_calling_system_prompt(
+        allow_run_collection=allow_run_collection,
+        pollutant_keys=list(AQ_AGENT_POLLUTANTS),
+        language=language,
     )
 
 
 def _default_request_context(default_request: CollectionRequest) -> str:
-    return (
-        "Current UI defaults are available as optional hints, but the user's latest free-text instruction takes priority. "
-        f"Defaults: city_query={default_request.city_query!r}, country_code={default_request.country_code!r}, "
-        f"start_year={default_request.start_year}, end_year={default_request.end_year}, "
-        f"pollutants={default_request.normalized_pollutants()}, include_weather={default_request.include_weather}, "
-        f"weather_fields={default_request.normalized_weather_fields()}."
-    )
+    return collection_agent_tools.default_request_context(default_request)
 
 
 def _collection_request_from_tool_arguments(arguments: dict[str, Any]) -> CollectionRequest:
-    city_query = str(arguments.get("city_query") or "").strip()
-    if not city_query:
-        raise ValueError("Tool arguments must include city_query.")
-
-    pollutants_raw = arguments.get("pollutants") or []
-    if not isinstance(pollutants_raw, list):
-        raise ValueError("Tool arguments field pollutants must be an array.")
-    weather_fields_raw = arguments.get("weather_fields")
-    if weather_fields_raw is not None and not isinstance(weather_fields_raw, list):
-        raise ValueError("Tool arguments field weather_fields must be an array when provided.")
-
-    return CollectionRequest(
-        city_query=city_query,
-        start_year=int(arguments.get("start_year")),
-        end_year=int(arguments.get("end_year")),
-        pollutants=[str(item) for item in pollutants_raw],
-        include_weather=bool(arguments.get("include_weather", True)),
-        country_code=_normalize_country_code(arguments.get("country_code")),
-        weather_fields=[str(item) for item in weather_fields_raw] if isinstance(weather_fields_raw, list) else None,
+    return collection_agent_tools.collection_request_from_tool_arguments(
+        arguments,
+        request_factory=CollectionRequest,
+        normalize_country_code=_normalize_country_code,
     )
 
 
@@ -1177,74 +978,35 @@ def _resolve_candidate_for_tool(
     state: ToolCallingAgentState,
     search_language: str,
 ) -> tuple[CityCandidate, list[CityCandidate]]:
-    normalized_country = _normalize_country_code(request.country_code)
-    can_reuse_last_search = (
-        state.last_candidates is not None
-        and state.last_search_query == request.city_query.strip()
-        and state.last_country_code == normalized_country
+    return collection_agent_tools.resolve_candidate_for_tool(
+        request,
+        candidate_index=candidate_index,
+        state=state,
+        search_language=search_language,
+        search_fn=search_city_candidates,
+        normalize_country_code=_normalize_country_code,
     )
-
-    if can_reuse_last_search:
-        candidates = state.last_candidates or []
-    else:
-        candidates = search_city_candidates(
-            request.city_query,
-            country_code=normalized_country,
-            count=max(candidate_index + 1, 5),
-            language=search_language,
-        )
-        state.last_candidates = candidates
-        state.last_search_query = request.city_query.strip()
-        state.last_country_code = normalized_country
-
-    if not candidates:
-        raise ValueError(f"No matching city candidates were found for {request.city_query!r}.")
-    if candidate_index < 0 or candidate_index >= len(candidates):
-        raise ValueError(f"candidate_index {candidate_index} is outside the available range 0..{len(candidates) - 1}.")
-
-    candidate = candidates[candidate_index]
-    state.selected_candidate = candidate
-    return candidate, candidates
 
 
 def _candidate_payload(candidate: CityCandidate, index: int | None = None) -> dict[str, Any]:
-    payload = candidate.to_dict()
-    payload["display_name"] = candidate.display_name
-    if index is not None:
-        payload["index"] = index
-    return payload
+    return collection_agent_tools.candidate_payload(candidate, index)
 
 
 def _collection_result_payload(result: CollectionResult) -> dict[str, Any]:
-    return {
-        "output_path": result.output_path,
-        "row_count": result.row_count,
-        "started_at": result.started_at,
-        "ended_at": result.ended_at,
-        "coverage_rows": result.coverage_rows,
-        "runtime_warnings": result.runtime_warnings,
-        "summary_text": result.summary_text,
-        "summary_mode": result.summary_mode,
-    }
+    return collection_agent_tools.collection_result_payload(result)
 
 
 def _fallback_agent_reply(state: ToolCallingAgentState, allow_run_collection: bool, language: str = "en") -> str:
-    if state.last_result is not None:
-        return state.last_result.summary_text
-    if state.last_plan is not None:
-        key = "collection.agent_planned" if not allow_run_collection else "collection.agent_prepared"
-        return t(key, language, city=state.last_plan.city_label)
-    return t("collection.agent_no_message", language)
+    return collection_agent_tools.fallback_agent_reply(
+        state,
+        allow_run_collection=allow_run_collection,
+        translate=t,
+        language=language,
+    )
 
 
 def _sanitize_assistant_message(message: dict[str, Any]) -> dict[str, Any]:
-    sanitized: dict[str, Any] = {
-        "role": "assistant",
-        "content": message.get("content"),
-    }
-    if message.get("tool_calls"):
-        sanitized["tool_calls"] = message["tool_calls"]
-    return sanitized
+    return collection_agent_tools.sanitize_assistant_message(message)
 
 
 def _generate_planner_guidance(

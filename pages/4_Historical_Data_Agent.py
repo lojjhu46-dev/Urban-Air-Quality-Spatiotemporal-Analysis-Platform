@@ -564,7 +564,7 @@ if last_result:
         if output_path.suffix.lower() == ".parquet":
             st.download_button(
                 t("common.download_csv", language),
-                data=preview_df.to_csv(index=False).encode("utf-8"),
+                data=preview_df.to_csv(index=False).encode("utf-8-sig"),
                 file_name=output_path.with_suffix(".csv").name,
                 mime="text/csv",
             )

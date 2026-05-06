@@ -81,7 +81,7 @@ def write_dataset(df: pd.DataFrame, path: str | Path) -> Path:
     if output_path.suffix.lower() == ".parquet":
         df.to_parquet(output_path, index=False)
     elif output_path.suffix.lower() == ".csv":
-        df.to_csv(output_path, index=False)
+        df.to_csv(output_path, index=False, encoding="utf-8-sig")
     else:
         raise ValueError(f"Unsupported dataset suffix: {output_path.suffix}")
 
