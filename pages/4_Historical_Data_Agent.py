@@ -5,9 +5,16 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+import src.agent_task_executor as agent_task_executor
 from src.agent_task_store import AgentTaskStatus, PostgresAgentTaskStore, task_store_from_config
-from src.agent_task_runner import AgentTaskRunConfig, start_background_custom_city_task
-from src.agent_task_watchdog import AgentTaskWatchdogConfig, mark_timed_out_if_needed
+from src.agent_task_ui import (
+    AgentTaskUiContext,
+    render_current_task_confirmation_panel,
+    render_current_task_status_panel,
+    render_task_status_panel_once,
+)
+from src.agent_task_runner import AgentTaskRunConfig
+from src.agent_task_watchdog import AgentTaskWatchdogConfig
 from src.agent_interaction import AgentCityOption, all_city_options
 from src.charts import trend_figure
 from src.collection_agent import custom_city_validation_from_dict, collection_plan_from_dict
@@ -15,7 +22,7 @@ from src.config import AQ_AGENT_DEFAULT_MODEL, AQ_AGENT_POLLUTANTS, AQ_AGENT_TAS
 from src.data import load_dataset
 from src.i18n import get_language, render_language_selector, t, weather_label
 from src.navigation import render_sidebar_navigation
-from src.ui import DATASET_OVERRIDE_KEY, PENDING_DATASET_CHOICE_KEY, dataset_path_from_env, render_dataframe
+from src.ui import dataset_path_from_env, render_dataframe
 
 language = get_language()
 st.set_page_config(page_title=t("agent.page_title", language), layout="wide")
@@ -47,14 +54,6 @@ TASK_STORE_KEY = "aq_agent_task_store"
 TASK_STORE_URL_KEY = "aq_agent_task_store_url"
 CURRENT_TASK_KEY = "aq_agent_current_task_id"
 SYNCED_TASK_RESULT_KEY = "aq_agent_synced_task_result"
-TERMINAL_TASK_STATUSES = {
-    AgentTaskStatus.PLANNED,
-    AgentTaskStatus.SAVED,
-    AgentTaskStatus.FAILED,
-    AgentTaskStatus.TIMEOUT,
-}
-
-
 def _safe_secret(key: str) -> str | None:
     try:
         value = st.secrets.get(key)
@@ -106,6 +105,14 @@ def _planner_model() -> str:
 
 def _planner_base_url() -> str:
     return str(st.session_state.get("aq_agent_base_url", DEEPSEEK_BASE_URL)).strip() or DEEPSEEK_BASE_URL
+
+
+def _agent_task_executor_mode() -> str | None:
+    return _safe_secret("agent_task_executor_mode")
+
+
+def _agent_task_executor():
+    return agent_task_executor.agent_task_executor_from_config(_agent_task_executor_mode())
 
 
 def _task_database_url() -> str | None:
@@ -211,217 +218,34 @@ def _start_custom_task(action: str):
     return store, task.task_id
 
 
-def _format_task_timestamp(value) -> str:
-    if value is None:
-        return "-"
-    return str(value).replace("+00:00", " UTC")
-
-
-def _task_result_signature(task) -> tuple[str, str, str]:
-    return task.task_id, task.status.value, task.output_path or ""
-
-
-def _sync_task_result_to_session(task) -> bool:
-    if task.status not in {AgentTaskStatus.PLANNED, AgentTaskStatus.SAVED} or not task.result_payload:
-        return False
-
-    signature = _task_result_signature(task)
-    if st.session_state.get(SYNCED_TASK_RESULT_KEY) == signature:
-        return False
-
-    if task.status == AgentTaskStatus.PLANNED and task.result_payload:
-        st.session_state["aq_agent_plan"] = dict(task.result_payload)
-    if task.status == AgentTaskStatus.SAVED and task.result_payload:
-        plan = task.result_payload.get("plan")
-        if isinstance(plan, dict):
-            st.session_state["aq_agent_plan"] = dict(plan)
-        if task.output_path:
-            st.session_state[DATASET_OVERRIDE_KEY] = task.output_path
-            st.session_state[PENDING_DATASET_CHOICE_KEY] = task.output_path
-        st.session_state["aq_agent_last_result"] = {
-            "output_path": task.output_path or "",
-            "summary_text": str(task.result_payload.get("summary_text") or task.message),
-            "summary_mode": str(task.result_payload.get("summary_mode") or "deterministic"),
-            "runtime_warnings": list(task.result_payload.get("runtime_warnings") or []),
-            "coverage_rows": list(task.result_payload.get("coverage_rows") or []),
-            "row_count": int(task.result_payload.get("row_count") or 0),
-            "started_at": str(task.result_payload.get("started_at") or ""),
-            "ended_at": str(task.result_payload.get("ended_at") or ""),
-        }
-    st.session_state[SYNCED_TASK_RESULT_KEY] = signature
-    return True
-
-
-def _render_task_confirmation_controls(task) -> None:
-    if task.status != AgentTaskStatus.PENDING or task.phase != "AWAITING_CONFIRMATION":
-        return
-    validation_data = task.result_payload.get("validation") if isinstance(task.result_payload, dict) else None
-    if not isinstance(validation_data, dict):
-        return
-    validation = custom_city_validation_from_dict(validation_data)
-    country, city = _custom_city_inputs()
-    if validation.input_country.casefold() != country.casefold() or validation.input_city.casefold() != city.casefold():
-        return
-
-    city_label = validation.corrected_city or validation.input_city
-    country_label = validation.corrected_country or validation.input_country
-    if validation.matching_countries:
-        st.info(
-            t(
-                "agent.custom_city_matching_countries",
-                language,
-                countries=", ".join(validation.matching_countries),
-            )
-        )
-    confirm_left, confirm_right = st.columns((1, 1))
-    if confirm_left.button(t("agent.custom_city_confirm_yes", language), use_container_width=True, key=f"{task.task_id}_confirm_yes"):
-        if not validation.country_code:
-            st.error(t("agent.custom_city_country_code_missing", language))
-            return
-        st.session_state[CUSTOM_VALIDATION_KEY] = validation.to_dict()
-        st.session_state[CUSTOM_CONFIRMED_KEY] = True
-        action = str(task.result_payload.get("action") or task.request_payload.get("action") or "plan")
-        next_store, next_task_id = _start_custom_task(action)
-        start_background_custom_city_task(
-            next_store,
-            next_task_id,
-            AgentTaskRunConfig(
-                api_key=_planner_api_key(),
-                model=_planner_model(),
-                base_url=_planner_base_url(),
-                language=language,
-                timeout_seconds=_agent_task_timeout_seconds(),
-            ),
-        )
-        st.success(t("agent.custom_city_confirmed", language, city=city_label, country=country_label))
-        st.rerun()
-    if confirm_right.button(t("agent.custom_city_confirm_no", language), use_container_width=True, key=f"{task.task_id}_confirm_no"):
-        _clear_custom_city_validation()
-        st.session_state.pop(CURRENT_TASK_KEY, None)
-        st.rerun()
-
-
-def _render_task_status_panel_body() -> None:
-    task_id = st.session_state.get(CURRENT_TASK_KEY)
-    if not task_id:
-        return
-
-    try:
-        store = _task_store()
-        task = store.get_task(str(task_id))
-        logs = store.list_logs(str(task_id), limit=20)
-        if task is not None:
-            task = mark_timed_out_if_needed(store, task, logs, _task_watchdog_config())
-            logs = store.list_logs(str(task_id), limit=20)
-    except Exception as exc:  # noqa: BLE001
-        st.warning(t("agent.task_status_unavailable", language, error=exc))
-        return
-
-    if task is None:
-        st.info(t("agent.task_status_missing", language, task_id=task_id))
-        return
-
-    synced_task_result = _sync_task_result_to_session(task)
-
-    st.subheader(t("agent.task_status_section", language))
-    st.caption(
-        t(
-            "agent.task_status_caption",
-            language,
-            task_id=task.task_id,
-            updated_at=_format_task_timestamp(task.updated_at),
-        )
+def _submit_custom_city_task(store, task_id: str, *, api_key: str | None):
+    return _agent_task_executor().submit_custom_city_task(
+        store,
+        task_id,
+        AgentTaskRunConfig(
+            api_key=api_key,
+            model=_planner_model(),
+            base_url=_planner_base_url(),
+            language=language,
+            timeout_seconds=_agent_task_timeout_seconds(),
+        ),
     )
 
-    status_col, phase_col, progress_col = st.columns(3)
-    status_col.metric(t("agent.task_status_label", language), task.status.value)
-    phase_col.metric(t("agent.task_phase_label", language), task.phase)
-    progress_col.metric(t("agent.task_progress_label", language), f"{task.progress:.0%}")
-    st.caption(
-        t(
-            "agent.task_state_line",
-            language,
-            status=task.status.value,
-            phase=task.phase,
-            progress=f"{task.progress:.0%}",
-        )
+
+def _task_ui_context() -> AgentTaskUiContext:
+    return AgentTaskUiContext(
+        language=language,
+        current_task_key=CURRENT_TASK_KEY,
+        synced_task_result_key=SYNCED_TASK_RESULT_KEY,
+        custom_validation_key=CUSTOM_VALIDATION_KEY,
+        custom_confirmed_key=CUSTOM_CONFIRMED_KEY,
+        store_factory=_task_store,
+        custom_city_inputs=_custom_city_inputs,
+        clear_custom_city_validation=_clear_custom_city_validation,
+        start_custom_task=_start_custom_task,
+        submit_custom_city_task=lambda store, task_id: _submit_custom_city_task(store, task_id, api_key=_planner_api_key()),
+        watchdog_config=_task_watchdog_config(),
     )
-    st.progress(task.progress)
-
-    if task.message:
-        st.write(task.message)
-    if task.output_path:
-        st.success(t("agent.task_output_path", language, path=task.output_path))
-    if task.error:
-        st.error(t("agent.task_error", language, error=task.error))
-
-    if logs:
-        logs_expanded = task.status not in TERMINAL_TASK_STATUSES
-        with st.expander(t("agent.task_log_section", language), expanded=logs_expanded):
-            for log in logs[-10:]:
-                st.caption(
-                    t(
-                        "agent.task_log_item",
-                        language,
-                        created_at=_format_task_timestamp(log.created_at),
-                        level=log.level,
-                        phase=log.phase,
-                        message=log.message,
-                    )
-                )
-
-    if synced_task_result:
-        st.rerun(scope="app")
-
-
-def _render_task_status_panel_once(container=None) -> None:
-    if container is None:
-        _render_task_status_panel_body()
-        return
-    with container.container():
-        _render_task_status_panel_body()
-
-
-def _render_current_task_status_panel(container=None) -> None:
-    def _render() -> None:
-        _render_task_status_panel_once(container)
-
-    fragment = getattr(st, "fragment", None)
-    if fragment is None:
-        _render()
-        return
-
-    @fragment(run_every="2s")
-    def _task_status_fragment() -> None:
-        _render()
-
-    _task_status_fragment()
-
-
-def _render_current_task_confirmation_controls() -> None:
-    task_id = st.session_state.get(CURRENT_TASK_KEY)
-    if not task_id:
-        return
-    try:
-        store = _task_store()
-        task = store.get_task(str(task_id))
-    except Exception:  # noqa: BLE001
-        return
-    if task is not None:
-        _render_task_confirmation_controls(task)
-
-
-def _render_current_task_confirmation_panel() -> None:
-    fragment = getattr(st, "fragment", None)
-    if fragment is None:
-        _render_current_task_confirmation_controls()
-        return
-
-    @fragment(run_every="2s")
-    def _task_confirmation_fragment() -> None:
-        _render_current_task_confirmation_controls()
-
-    _task_confirmation_fragment()
 
 
 def _custom_city_inputs() -> tuple[str, str]:
@@ -665,25 +489,16 @@ if agent_plan_clicked or agent_collect_clicked:
             status.error(t("agent.custom_city_requires_key", language))
         else:
             active_task_store, active_task_id = _start_custom_task(action)
-            start_background_custom_city_task(
-                active_task_store,
-                active_task_id,
-                AgentTaskRunConfig(
-                    api_key=api_key,
-                    model=_planner_model(),
-                    base_url=_planner_base_url(),
-                    language=language,
-                    timeout_seconds=_agent_task_timeout_seconds(),
-                ),
-            )
+            _submit_custom_city_task(active_task_store, active_task_id, api_key=api_key)
             progress.empty()
             status.success(t("agent.task_started", language))
-            _render_task_status_panel_once(task_status_slot)
+            render_task_status_panel_once(_task_ui_context(), task_status_slot)
     except Exception as exc:  # noqa: BLE001
         st.error(t("agent.tool_failed", language, error=exc))
 
-_render_current_task_status_panel(task_status_slot)
-_render_current_task_confirmation_panel()
+_task_ui = _task_ui_context()
+render_current_task_status_panel(_task_ui, task_status_slot)
+render_current_task_confirmation_panel(_task_ui)
 
 stored_plan = st.session_state.get("aq_agent_plan")
 if stored_plan:

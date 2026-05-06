@@ -7,6 +7,8 @@ import pandas as pd
 from streamlit.testing.v1 import AppTest
 
 import src.agent_task_store as agent_task_store
+import src.agent_task_executor as agent_task_executor
+import src.agent_task_runner as agent_task_runner
 import src.collection_agent as collection_agent
 from src.ui import DATASET_CHOICE_KEY, DATASET_OVERRIDE_KEY, PENDING_DATASET_CHOICE_KEY
 from src.agent_task_store import AgentTaskStatus, InMemoryAgentTaskStore
@@ -33,6 +35,58 @@ from src.collection_agent import (
     CollectionResult,
     CustomCityValidationResult,
 )
+
+
+class FakeAgentTaskExecutor:
+    def __init__(self, submissions: list[tuple[object, str, object]], *, terminal_status: AgentTaskStatus = AgentTaskStatus.PLANNED) -> None:
+        self.submissions = submissions
+        self.terminal_status = terminal_status
+
+    def submit_custom_city_task(self, store, task_id: str, config):  # noqa: ANN001
+        self.submissions.append((store, task_id, config))
+        store.update_task(
+            task_id,
+            status=self.terminal_status,
+            phase=self.terminal_status.value,
+            progress=1.0,
+            message="Submitted by fake executor",
+            result_payload=_fake_plan_payload(),
+        )
+        return agent_task_executor.AgentTaskSubmission(
+            task_id=task_id,
+            mode="fake",
+            started=True,
+            message="Submitted by fake executor",
+        )
+
+
+def _fake_plan_payload() -> dict[str, object]:
+    return {
+        "city_label": "Tokyo, Japan",
+        "city_query": "Tokyo",
+        "country_code": "JP",
+        "latitude": 35.6762,
+        "longitude": 139.6503,
+        "timezone": "Asia/Tokyo",
+        "source_name": "Open-Meteo Air Quality Archive",
+        "source_domain": "auto",
+        "sampling_step": "3-hourly",
+        "requested_start_date": "2024-01-01",
+        "requested_end_date": "2026-12-31",
+        "actual_start_date": "2024-01-01",
+        "actual_end_date": "2026-05-03",
+        "pollutants": ["pm25"],
+        "pollutant_variables": ["pm2_5"],
+        "weather_variables": [],
+        "chunks": [{"start_date": "2024-01-01", "end_date": "2024-01-31"}],
+        "output_path": "data/processed/agent_runs/tokyo_2024_2026_aq.parquet",
+        "warnings": [],
+        "planner_mode": "deterministic",
+        "planner_model": None,
+        "planner_notes": "Fake executor plan.",
+        "quality_checks": [],
+        "risk_flags": [],
+    }
 
 
 def _wait_for_task_status(
@@ -196,6 +250,42 @@ def test_agent_page_stable_city_candidate_prefills_custom_inputs() -> None:
     assert at.session_state["aq_agent_custom_city_confirmed"] is True
     assert validation["corrected_city"] == "Kyoto"
     assert validation["country_code"] == "JP"
+
+
+def test_agent_page_submits_draft_plan_through_executor(monkeypatch) -> None:
+    store = InMemoryAgentTaskStore()
+    submissions: list[tuple[object, str, object]] = []
+    requested_modes: list[str | None] = []
+
+    def fail_start_background(*args, **kwargs):  # noqa: ANN001
+        del args, kwargs
+        raise AssertionError("page should submit through agent task executor")
+
+    monkeypatch.setattr(agent_task_store, "task_store_from_config", lambda database_url: store)
+    monkeypatch.setattr(agent_task_runner, "start_background_custom_city_task", fail_start_background)
+    monkeypatch.setattr(
+        agent_task_executor,
+        "agent_task_executor_from_config",
+        lambda mode=None: requested_modes.append(mode) or FakeAgentTaskExecutor(submissions),
+    )
+
+    at = AppTest.from_file("pages/4_Historical_Data_Agent.py")
+    at.secrets["deepseek_api_key"] = "sk-test"
+    at.secrets["agent_task_executor_mode"] = "unknown-mode"
+    at.run()
+    next(widget for widget in at.text_input if widget.label == "Country / region").set_value("Japan").run()
+    next(widget for widget in at.text_input if widget.label == "City name").set_value("Tokyo").run()
+    next(button for button in at.button if button.label == "Agent: Draft Plan").click().run()
+
+    task = store.get_task(at.session_state["aq_agent_current_task_id"])
+
+    assert len(submissions) == 1
+    assert submissions[0][0] is store
+    assert submissions[0][1] == task.task_id
+    assert submissions[0][2].api_key == "sk-test"
+    assert requested_modes[-1] == "unknown-mode"
+    assert task.status == AgentTaskStatus.PLANNED
+    assert task.result_payload["city_label"] == "Tokyo, Japan"
 
 
 def test_custom_city_validated_location_uses_direct_collection_flow(monkeypatch) -> None:
@@ -869,3 +959,73 @@ def test_custom_city_confirmation_yes_resumes_pending_agent_action(monkeypatch) 
     assert calls["search"] == ("Tokyo", "JP", 10, "en")
     assert calls["plan"][0].city_query == "Tokyo"
     assert task.result_payload["city_label"] == "Tokyo, Japan"
+
+
+def test_custom_city_confirmation_yes_submits_through_executor(monkeypatch) -> None:
+    store = InMemoryAgentTaskStore()
+    submissions: list[tuple[object, str, object]] = []
+
+    validation = CustomCityValidationResult(
+        input_country="Japen",
+        input_city="Tokio",
+        status="needs_confirmation",
+        corrected_country="Japan",
+        corrected_city="Tokyo",
+        country_code="JP",
+        matching_countries=["Japan"],
+        message="Did you mean Tokyo, Japan?",
+    )
+    pending_task = store.create_task(
+        kind="custom_city_collection",
+        request_payload={
+            "kind": "custom_city_collection",
+            "action": "plan",
+            "input_country": "Japen",
+            "input_city": "Tokio",
+            "city_query": "Tokio",
+            "country_code": "",
+            "start_year": 2024,
+            "end_year": 2026,
+            "pollutants": ["pm25"],
+            "include_weather": False,
+            "weather_fields": [],
+        },
+    )
+    store.update_task(
+        pending_task.task_id,
+        status=AgentTaskStatus.PENDING,
+        phase="AWAITING_CONFIRMATION",
+        progress=0.12,
+        message=validation.message,
+        result_payload={"validation": validation.to_dict(), "action": "plan"},
+    )
+
+    def fail_start_background(*args, **kwargs):  # noqa: ANN001
+        del args, kwargs
+        raise AssertionError("confirmation should submit through agent task executor")
+
+    monkeypatch.setattr(agent_task_store, "task_store_from_config", lambda database_url: store)
+    monkeypatch.setattr(agent_task_runner, "start_background_custom_city_task", fail_start_background)
+    monkeypatch.setattr(
+        agent_task_executor,
+        "agent_task_executor_from_config",
+        lambda mode=None: FakeAgentTaskExecutor(submissions),
+    )
+
+    at = AppTest.from_file("pages/4_Historical_Data_Agent.py")
+    at.secrets["deepseek_api_key"] = "sk-test"
+    at.session_state["aq_agent_task_store"] = store
+    at.session_state["aq_agent_task_store_url"] = ""
+    at.session_state["aq_agent_current_task_id"] = pending_task.task_id
+    at.session_state["aq_agent_custom_country"] = "Japen"
+    at.session_state["aq_agent_custom_city_name"] = "Tokio"
+    at.run()
+
+    next(button for button in at.button if button.label == "Yes, continue").click().run()
+    resumed_task = store.get_task(at.session_state["aq_agent_current_task_id"])
+
+    assert len(submissions) == 1
+    assert submissions[0][0] is store
+    assert submissions[0][1] == resumed_task.task_id
+    assert submissions[0][2].api_key == "sk-test"
+    assert resumed_task.status == AgentTaskStatus.PLANNED
