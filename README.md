@@ -293,6 +293,37 @@ deepseek_api_key = "sk-..."
 deepseek_model = "deepseek-v4-flash"
 ```
 
+### Streamlit Cloud + Supabase + Worker
+
+推荐的云端最小闭环是：Streamlit Cloud 运行 UI，Supabase Postgres 托管任务状态、任务日志和数据集索引，独立 worker 进程执行 Historical Data Agent 的采集任务。
+
+在 Streamlit Cloud secrets 中配置：
+
+```toml
+database_url = "postgresql://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:6543/postgres"
+agent_task_executor_mode = "worker"
+dataset_storage_mode = "supabase"
+supabase_url = "https://<project-ref>.supabase.co"
+supabase_service_role_key = "<service-role-key>"
+supabase_storage_bucket = "aq-datasets"
+deepseek_api_key = "sk-..."
+deepseek_model = "deepseek-v4-flash"
+```
+
+在 Supabase SQL Editor 中执行 `docs/supabase_agent_tasks.sql`，创建 `agent_tasks`、`agent_task_logs` 和 `dataset_index`。`dataset_index` 只保存数据集元数据和文件位置，不保存空气质量明细行。
+
+在 Supabase Storage 中创建 `aq-datasets` bucket。worker 采集完成后会把生成的 parquet/csv 上传到该 bucket，并在 `dataset_index.storage_uri` 中记录 `supabase://aq-datasets/...`。Streamlit UI 选择远程数据集时会先下载到 `.cache/datasets/`，再复用现有数据加载和分析流程。
+
+worker 可部署在 Render、Railway、Fly.io 或 VPS：
+
+```bash
+DATABASE_URL="postgresql://..." DATASET_STORAGE_MODE="supabase" SUPABASE_URL="https://<project-ref>.supabase.co" SUPABASE_SERVICE_ROLE_KEY="<service-role-key>" SUPABASE_STORAGE_BUCKET="aq-datasets" DEEPSEEK_API_KEY="sk-..." python -m src.worker
+```
+
+`thread` 模式仍适合本地和单进程部署；`worker` 模式只提交 PENDING 任务，由独立 worker 原子 claim 后执行。为避免重复采集，历史 `RUNNING` 任务不会在进程重启后自动重跑，仍由 watchdog 标记为 `TIMEOUT`。
+
+上线前请按 `docs/cloud_deployment.md` 执行 Supabase smoke test 和端到端检查。
+
 ## 配置与运行特性
 
 - 默认时区：`Asia/Shanghai`

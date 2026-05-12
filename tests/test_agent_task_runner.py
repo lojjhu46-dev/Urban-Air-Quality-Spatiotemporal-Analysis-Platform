@@ -6,6 +6,8 @@ import pandas as pd
 
 import src.agent_task_runner as agent_task_runner
 import src.collection_agent as collection_agent
+import src.dataset_registry as dataset_registry
+import src.dataset_storage as dataset_storage
 from src.agent_task_runner import AgentTaskRunConfig, run_custom_city_task, start_background_custom_city_task
 from src.agent_task_store import AgentTaskStatus, InMemoryAgentTaskStore
 from src.collection_agent import CityCandidate, CollectionPlan, CollectionResult, CustomCityValidationResult
@@ -170,6 +172,69 @@ def test_run_custom_city_task_collects_and_writes_status_chain(monkeypatch) -> N
     assert updated.output_path == "data/processed/agent_runs/tokyo_2024_2026_aq.parquet"
     assert updated.result_payload["row_count"] == 1
     assert [log.phase for log in logs] == ["VALIDATING", "RESOLVING", "PLANNING", "COLLECTING", "SAVED"]
+
+
+def test_run_custom_city_task_registers_remote_storage_uri(monkeypatch) -> None:
+    store = InMemoryAgentTaskStore()
+    task = store.create_task(kind="custom_city_collection", request_payload=_custom_payload("collect"))
+    entries: list[dataset_registry.DatasetIndexEntry] = []
+
+    class FakeStorage:
+        def put_file(self, path):  # noqa: ANN001
+            assert str(path) == "data/processed/agent_runs/tokyo_2024_2026_aq.parquet"
+            return "supabase://aq-data/tokyo_2024_2026_aq.parquet"
+
+    class FakeRegistry:
+        def add_entry(self, entry: dataset_registry.DatasetIndexEntry) -> None:
+            entries.append(entry)
+
+    def fake_validate(country_or_region: str, city_name: str, **kwargs):  # noqa: ANN001
+        del kwargs
+        return CustomCityValidationResult(
+            input_country=country_or_region,
+            input_city=city_name,
+            status="valid",
+            corrected_country="Japan",
+            corrected_city="Tokyo",
+            country_code="JP",
+            matching_countries=["Japan"],
+            message="Tokyo, Japan is valid.",
+        )
+
+    def fake_search(query: str, country_code: str | None = None, count: int = 5, language: str = "en") -> list[CityCandidate]:
+        del query, country_code, count, language
+        return [_tokyo_candidate()]
+
+    def fake_run_collection(request, candidate, **kwargs):  # noqa: ANN001
+        del kwargs
+        plan = _tokyo_plan(request, candidate)
+        return CollectionResult(
+            plan=plan,
+            dataset=pd.DataFrame({"timestamp": ["2024-01-01 00:00:00"], "pm25": [12.0]}),
+            output_path=plan.output_path,
+            row_count=1,
+            started_at="2024-01-01 00:00:00",
+            ended_at="2024-01-01 00:00:00",
+            coverage_rows=[{"pollutant": "pm25", "non_null_ratio": 1.0}],
+            runtime_warnings=[],
+            summary_text="Saved Tokyo dataset.",
+            summary_mode="deterministic",
+        )
+
+    monkeypatch.setattr(collection_agent, "validate_custom_city_with_deepseek", fake_validate)
+    monkeypatch.setattr(collection_agent, "search_city_candidates", fake_search)
+    monkeypatch.setattr(collection_agent, "run_collection_agent", fake_run_collection)
+    monkeypatch.setattr(dataset_storage, "dataset_storage_from_env", lambda: FakeStorage())
+    monkeypatch.setattr(dataset_registry, "dataset_registry_from_config", lambda database_url: FakeRegistry())
+
+    run_custom_city_task(store, task.task_id, AgentTaskRunConfig(api_key="sk-test"))
+
+    updated = store.get_task(task.task_id)
+    assert updated is not None
+    assert updated.status == AgentTaskStatus.SAVED
+    assert updated.output_path == "supabase://aq-data/tokyo_2024_2026_aq.parquet"
+    assert updated.result_payload["output_path"] == "supabase://aq-data/tokyo_2024_2026_aq.parquet"
+    assert entries[0].storage_uri == "supabase://aq-data/tokyo_2024_2026_aq.parquet"
 
 
 def test_run_custom_city_task_uses_confirmed_validation_without_revalidating(monkeypatch) -> None:

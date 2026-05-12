@@ -62,6 +62,37 @@ def test_terminal_task_status_cannot_be_overwritten_by_late_runner_update() -> N
     assert updated.output_path is None
 
 
+def test_in_memory_task_store_claims_only_pending_custom_city_tasks() -> None:
+    store = InMemoryAgentTaskStore()
+    ignored = store.create_task(kind="other_kind", request_payload={"city_query": "Kyoto"})
+    pending = store.create_task(kind="custom_city_collection", request_payload={"city_query": "Tokyo"})
+
+    claimed = store.claim_next_pending_task()
+    second_claim = store.claim_next_pending_task()
+
+    assert claimed is not None
+    assert claimed.task_id == pending.task_id
+    assert claimed.status == AgentTaskStatus.RUNNING
+    assert claimed.started_at is not None
+    assert store.get_task(pending.task_id).status == AgentTaskStatus.RUNNING
+    assert store.get_task(ignored.task_id).status == AgentTaskStatus.PENDING
+    assert second_claim is None
+
+
+def test_in_memory_task_store_updates_running_task_heartbeat() -> None:
+    store = InMemoryAgentTaskStore()
+    task = store.create_task(kind="custom_city_collection", request_payload={"city_query": "Tokyo"})
+    claimed = store.claim_next_pending_task()
+    assert claimed is not None
+    before = claimed.updated_at
+
+    store.update_heartbeat(task.task_id)
+
+    after = store.get_task(task.task_id)
+    assert after is not None
+    assert after.updated_at >= before
+
+
 def test_task_store_from_config_uses_memory_when_database_url_missing() -> None:
     store = task_store_from_config(database_url=None)
 

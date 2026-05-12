@@ -134,6 +134,26 @@ class InMemoryAgentTaskStore:
         with self._lock:
             return list(self._logs.get(task_id, []))[-limit:]
 
+    def claim_next_pending_task(self) -> AgentTask | None:
+        with self._lock:
+            for task in self._tasks.values():
+                if task.status != AgentTaskStatus.PENDING or task.kind != "custom_city_collection":
+                    continue
+                now = _utc_now()
+                task.status = AgentTaskStatus.RUNNING
+                task.phase = "RUNNING"
+                task.message = "Task claimed by worker"
+                task.started_at = task.started_at or now
+                task.updated_at = now
+                return task
+        return None
+
+    def update_heartbeat(self, task_id: str) -> None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is not None and task.status == AgentTaskStatus.RUNNING:
+                task.updated_at = _utc_now()
+
 
 def _task_from_row(row: dict[str, Any]) -> AgentTask:
     return AgentTask(
@@ -322,6 +342,56 @@ class PostgresAgentTaskStore:
                 )
                 rows = cursor.fetchall()
         return [_log_from_row(dict(row)) for row in reversed(rows)]
+
+    def claim_next_pending_task(self) -> AgentTask | None:
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    select task_id
+                    from agent_tasks
+                    where status = %s and kind = %s
+                    order by created_at
+                    limit 1
+                    for update skip locked
+                    """,
+                    (AgentTaskStatus.PENDING.value, "custom_city_collection"),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                cursor.execute(
+                    """
+                    update agent_tasks
+                    set status = %s,
+                        phase = %s,
+                        message = %s,
+                        started_at = coalesce(started_at, now()),
+                        updated_at = now()
+                    where task_id = %s
+                    returning *
+                    """,
+                    (
+                        AgentTaskStatus.RUNNING.value,
+                        "RUNNING",
+                        "Task claimed by worker",
+                        row["task_id"],
+                    ),
+                )
+                updated = cursor.fetchone()
+        return _task_from_row(dict(updated)) if updated is not None else None
+
+    def update_heartbeat(self, task_id: str) -> None:
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    update agent_tasks
+                    set updated_at = now()
+                    where task_id = %s and status = %s
+                    """,
+                    (task_id, AgentTaskStatus.RUNNING.value),
+                )
 
 
 def task_store_from_config(database_url: str | None) -> InMemoryAgentTaskStore | PostgresAgentTaskStore:

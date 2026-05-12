@@ -7,6 +7,8 @@ from typing import Protocol
 import unicodedata
 
 import src.collection_agent as collection_agent
+import src.dataset_registry as dataset_registry
+import src.dataset_storage as dataset_storage
 from src.agent_interaction import all_city_options, build_city_search_queries
 from src.agent_task_store import AgentTaskStatus
 from src.collection_agent import CollectionRequest, custom_city_validation_from_dict
@@ -189,14 +191,16 @@ def run_custom_city_task(store: AgentTaskStore, task_id: str, config: AgentTaskR
                 ),
                 language=config.language,
             )
+            stored_output_uri = _store_dataset_result(task_id, result)
             _record_step(
                 store,
                 task_id,
                 status=AgentTaskStatus.SAVED,
                 phase="SAVED",
                 progress=1.0,
-                message=t("collection.progress_saved", config.language, path=result.output_path),
+                message=t("collection.progress_saved", config.language, path=stored_output_uri),
                 result_payload={
+                    "output_path": stored_output_uri,
                     "row_count": result.row_count,
                     "started_at": result.started_at,
                     "ended_at": result.ended_at,
@@ -206,7 +210,7 @@ def run_custom_city_task(store: AgentTaskStore, task_id: str, config: AgentTaskR
                     "coverage_rows": result.coverage_rows,
                     "plan": result.plan.to_dict(),
                 },
-                output_path=result.output_path,
+                output_path=stored_output_uri,
             )
         else:
             plan = collection_agent.build_collection_plan(
@@ -244,6 +248,40 @@ def _collection_request_from_payload(payload: dict[str, object], validation) -> 
         country_code=validation.country_code,
         weather_fields=weather_fields,
     )
+
+
+def _store_dataset_result(task_id: str, result) -> str:
+    stored_output_uri = str(result.output_path)
+    try:
+        stored_output_uri = dataset_storage.dataset_storage_from_env().put_file(result.output_path)
+    except Exception:  # noqa: BLE001
+        stored_output_uri = str(result.output_path)
+
+    try:
+        registry = dataset_registry.dataset_registry_from_config(_env_database_url())
+        plan = result.plan
+        registry.add_entry(
+            dataset_registry.DatasetIndexEntry(
+                city=plan.city_label,
+                country_code=plan.country_code,
+                start_date=plan.actual_start_date,
+                end_date=plan.actual_end_date,
+                pollutants=list(plan.pollutants),
+                row_count=int(result.row_count),
+                format=stored_output_uri.rsplit(".", maxsplit=1)[-1],
+                storage_uri=stored_output_uri,
+                source_task_id=task_id,
+            )
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return stored_output_uri
+
+
+def _env_database_url() -> str | None:
+    import os
+
+    return os.environ.get("DATABASE_URL") or os.environ.get("database_url")
 
 
 def _resolve_city_candidate(

@@ -20,6 +20,7 @@ from src.charts import trend_figure
 from src.collection_agent import custom_city_validation_from_dict, collection_plan_from_dict
 from src.config import AQ_AGENT_DEFAULT_MODEL, AQ_AGENT_POLLUTANTS, AQ_AGENT_TASK_STALLED_SECONDS, AQ_AGENT_TASK_TIMEOUT_SECONDS, DEEPSEEK_BASE_URL
 from src.data import load_dataset
+from src.dataset_storage import dataset_storage_from_env
 from src.i18n import get_language, render_language_selector, t, weather_label
 from src.navigation import render_sidebar_navigation
 from src.ui import dataset_path_from_env, render_dataframe
@@ -528,9 +529,13 @@ if last_result:
     if not coverage_df.empty:
         render_dataframe(coverage_df, use_container_width=True, hide_index=True)
 
-    output_path = Path(last_result["output_path"])
+    output_uri = str(last_result["output_path"])
+    try:
+        output_path = dataset_storage_from_env().get_file(output_uri)
+    except Exception:  # noqa: BLE001
+        output_path = Path(output_uri)
     if output_path.exists():
-        preview_df = load_dataset(output_path)
+        preview_df = load_dataset(output_uri)
         preview_pollutant = next(
             (
                 pollutant
