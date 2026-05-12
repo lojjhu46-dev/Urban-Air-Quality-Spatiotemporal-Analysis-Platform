@@ -9,17 +9,17 @@ services:
     maxShutdownDelaySeconds: 300
     envVars:
       - key: DATABASE_URL
-        sync: postgresql://postgres.rtbsklryqwprbhkerlxy:jm3320e27zj@aws-1-ap-northeast-1.pooler.supabase.com:6543/postgres
+        sync: false
       - key: DATASET_STORAGE_MODE
         value: supabase
       - key: SUPABASE_URL
-        sync: https://rtbsklryqwprbhkerlxy.supabase.co
+        sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
-        sync: sb_secret_PceLe4h5sV2d1t5423TjSw_mrMpF4B0
+        sync: false
       - key: SUPABASE_STORAGE_BUCKET
         value: aq-datasets
       - key: DEEPSEEK_API_KEY
-        sync: sk-817462bf144446629ca31e2ff0e6e0af
+        sync: false
       - key: DEEPSEEK_MODEL
         value: deepseek-v4-flash
       - key: DEEPSEEK_BASE_URL
