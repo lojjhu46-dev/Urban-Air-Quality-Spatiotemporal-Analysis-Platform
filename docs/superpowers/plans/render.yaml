@@ -1,0 +1,30 @@
+services:
+  - type: worker
+    name: aq-agent-worker
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m src.worker
+    autoDeployTrigger: commit
+    maxShutdownDelaySeconds: 300
+    envVars:
+      - key: DATABASE_URL
+        sync: postgresql://postgres.rtbsklryqwprbhkerlxy:jm3320e27zj@aws-1-ap-northeast-1.pooler.supabase.com:6543/postgres
+      - key: DATASET_STORAGE_MODE
+        value: supabase
+      - key: SUPABASE_URL
+        sync: https://rtbsklryqwprbhkerlxy.supabase.co
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: sb_secret_PceLe4h5sV2d1t5423TjSw_mrMpF4B0
+      - key: SUPABASE_STORAGE_BUCKET
+        value: aq-datasets
+      - key: DEEPSEEK_API_KEY
+        sync: sk-817462bf144446629ca31e2ff0e6e0af
+      - key: DEEPSEEK_MODEL
+        value: deepseek-v4-flash
+      - key: DEEPSEEK_BASE_URL
+        value: https://api.deepseek.com
+      - key: AGENT_LANGUAGE
+        value: en
+      - key: WORKER_POLL_SECONDS
+        value: "5"
