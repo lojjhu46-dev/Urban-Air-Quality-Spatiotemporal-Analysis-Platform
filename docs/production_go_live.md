@@ -1,13 +1,24 @@
 # 生产上线执行手册
 
-这份执行手册用于覆盖本仓库当前采用的生产部署形态的最后一段收口工作：
+这份执行手册用于从“准备上云”推进到“生产可用”。当前仓库已经具备云端部署所需的 worker、Supabase 表结构、存储适配器和 Render Blueprint，但真实云环境尚未完成接入前，不应把项目标记为已上线。
+
+目标生产部署形态：
 
 - Streamlit Community Cloud 承载 UI。
 - Supabase Postgres 存储任务状态和数据集索引元数据。
 - Supabase Storage 存储生成的数据集文件。
 - Render 运行常驻 worker，并负责 claim `PENDING` 任务。
 
-请结合 [docs/cloud_deployment.md](D:/C/python/new_python/docs/cloud_deployment.md) 一起使用。
+请结合 [docs/cloud_deployment.md](D:/C/python/new_python/docs/cloud_deployment.md) 一起使用。本文假设你已经决定正式接入云资源。
+
+## 0. 上线前置条件
+
+开始执行本文前，先确认：
+
+- 本地 `.streamlit/secrets.toml` 仍保持 `thread + local`，方便继续本地开发。
+- 全量测试通过：`.\.venv\Scripts\python.exe -m pytest -q`。
+- 你已经准备好 Supabase 项目、Render 账号和 Streamlit Community Cloud 应用入口权限。
+- 真实密钥只写入云平台 secrets 或本机临时环境变量，不提交到仓库。
 
 ## 1. Supabase 前置准备
 
@@ -111,6 +122,8 @@ python scripts/supabase_smoke_test.py
 Smoke test OK. storage_uri=supabase://...
 ```
 
+如果这里失败，停止上线流程。优先修复数据库连接、Storage bucket 名称、service role key 或网络访问问题。
+
 ## 5. 端到端 Claim 验证
 
 1. 打开已部署的 Streamlit 应用。
@@ -132,10 +145,30 @@ Smoke test OK. storage_uri=supabase://...
 
 ## 6. 完成判定
 
-只有当下面几项都成立时，才算生产上线闭环完成：
+只有当下面几项都成立时，才算从“准备上云”进入“生产云端闭环完成”：
 
 - Streamlit Cloud 能通过 `app.py` 正常启动。
 - Render worker 已启动且保持健康。
 - `scripts/supabase_smoke_test.py` 使用生产凭据执行通过。
 - 一个生产任务完整经历 `PENDING -> RUNNING -> SAVED`。
 - 保存后的数据集既能在 Supabase 元数据层看到，也能在 Streamlit UI 中加载使用。
+
+## 7. 回退方案
+
+如果生产联调遇到问题，可以先回退到本地闭环：
+
+1. 保持本地 `.streamlit/secrets.toml`：
+
+```toml
+agent_task_executor_mode = "thread"
+dataset_storage_mode = "local"
+data_path = "data/processed/beijing_aq.parquet"
+```
+
+2. 暂停 Render worker。
+3. 暂停或隐藏 Streamlit Cloud 应用入口。
+4. 继续使用本地命令运行：
+
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run app.py
+```

@@ -2,6 +2,15 @@
 
 本项目是一个基于 Streamlit 的多页面空气质量分析系统，既能对已有历史数据集进行时空分析，也能通过内置的历史数据 Agent 为指定城市生成新的可视化数据集。系统将数据加载、筛选分析、时空回放、相关性计算、历史采集、数据集切换和中英双语界面整合在同一个工作台中，适合用于城市空气质量教学演示、原型验证和轻量级研究分析。
 
+## 当前状态
+
+项目当前处于“本地闭环完整、云端部署准备中”的半步上云状态：
+
+- 本地模式已经可用：Streamlit UI、北京基础数据集、本地 Agent 采集、本地数据集切换和测试套件均已闭环。
+- 云端代码骨架已经接入：支持 `worker` 任务执行模式、Postgres 任务表、数据集索引、Supabase Storage 适配器和独立 worker 入口。
+- 真实云环境尚未启用：Supabase 项目、Storage bucket、生产 secrets、Render worker 和 Streamlit Cloud 应用还需要按文档完成配置与 smoke test。
+- 当前建议继续使用本地配置：`agent_task_executor_mode = "thread"`、`dataset_storage_mode = "local"`。准备真正上线时，再切换到 `worker + supabase`。
+
 ## 系统定位
 
 这个系统解决的是“从历史空气质量数据到可视化分析，再到新城市数据补采”的完整闭环问题：
@@ -198,7 +207,9 @@ Agent 的内部执行过程大致如下：
 
 ### Agent 任务执行器与恢复边界
 
-当前任务执行器模式为 `thread`，可通过 Streamlit secrets 中的 `agent_task_executor_mode = "thread"` 显式设置。该模式会在当前 Streamlit 进程内启动后台线程，适合本地运行和单进程部署。
+当前本地推荐的任务执行器模式为 `thread`，可通过 Streamlit secrets 中的 `agent_task_executor_mode = "thread"` 显式设置。该模式会在当前 Streamlit 进程内启动后台线程，适合本地运行和单进程部署。
+
+云端准备模式为 `worker`：Streamlit UI 只创建 `PENDING` 任务，独立 worker 进程从 Supabase Postgres 原子 claim 任务后执行采集，并把生成的数据集上传到 Supabase Storage。这个模式的代码和配置模板已经在仓库中准备好，但只有完成真实 Supabase、Render 和 Streamlit Cloud 配置后才应启用。
 
 为避免重复采集和重复写入输出文件，系统不会在进程重启后自动重跑已经持久化为 `RUNNING` 的历史任务。页面会继续展示任务状态，并由 watchdog 将长时间无进展的任务标记为 `TIMEOUT`。如果需要稳定的云端长任务执行，后续应接入外部 worker 或队列执行器。
 
@@ -293,9 +304,26 @@ deepseek_api_key = "sk-..."
 deepseek_model = "deepseek-v4-flash"
 ```
 
-### Streamlit Cloud + Supabase + Worker
+### 准备上云：Streamlit Cloud + Supabase + Worker
 
-推荐的云端最小闭环是：Streamlit Cloud 运行 UI，Supabase Postgres 托管任务状态、任务日志和数据集索引，独立 worker 进程执行 Historical Data Agent 的采集任务。
+准备上云时，推荐的最小闭环是：Streamlit Cloud 运行 UI，Supabase Postgres 托管任务状态、任务日志和数据集索引，Supabase Storage 保存生成的数据集文件，独立 worker 进程执行 Historical Data Agent 的采集任务。
+
+当前仓库已经包含这条路径所需的主要代码与配置模板：
+
+- `src.worker`：独立 worker 入口。
+- `docs/supabase_agent_tasks.sql`：Supabase Postgres 表结构。
+- `render.yaml`：Render Background Worker Blueprint。
+- `scripts/supabase_smoke_test.py`：真实 Supabase 连通性与存储 smoke test。
+- `.streamlit/secrets.toml.example`：本地模式和生产模式 secrets 示例。
+
+在真正切换到云端前，需要先完成：
+
+1. 创建 Supabase 项目并执行 `docs/supabase_agent_tasks.sql`。
+2. 创建 `aq-datasets` Storage bucket。
+3. 在 Streamlit Cloud 中配置生产 secrets。
+4. 在 Render 或等价平台部署 worker。
+5. 执行 `scripts/supabase_smoke_test.py`。
+6. 提交一个小范围 Agent 任务，确认 `PENDING -> RUNNING -> SAVED` 全流程通过。
 
 在 Streamlit Cloud secrets 中配置：
 
@@ -322,7 +350,7 @@ DATABASE_URL="postgresql://..." DATASET_STORAGE_MODE="supabase" SUPABASE_URL="ht
 
 `thread` 模式仍适合本地和单进程部署；`worker` 模式只提交 PENDING 任务，由独立 worker 原子 claim 后执行。为避免重复采集，历史 `RUNNING` 任务不会在进程重启后自动重跑，仍由 watchdog 标记为 `TIMEOUT`。
 
-上线前请按 `docs/cloud_deployment.md` 执行 Supabase smoke test 和端到端检查。
+上线前请按 `docs/cloud_deployment.md` 和 `docs/production_go_live.md` 执行 Supabase smoke test 与端到端检查。在这些检查完成前，项目应视为“准备上云”，而不是“已经生产上线”。
 
 ## 配置与运行特性
 
