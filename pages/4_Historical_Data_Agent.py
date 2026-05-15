@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 import src.agent_task_executor as agent_task_executor
-from src.agent_task_store import AgentTaskStatus, PostgresAgentTaskStore, task_store_from_config
+from src.agent_task_store import AgentTaskStatus, task_store_from_config
 from src.agent_task_ui import (
     AgentTaskUiContext,
     render_current_task_confirmation_panel,
@@ -20,7 +20,6 @@ from src.charts import trend_figure
 from src.collection_agent import custom_city_validation_from_dict, collection_plan_from_dict
 from src.config import AQ_AGENT_DEFAULT_MODEL, AQ_AGENT_POLLUTANTS, AQ_AGENT_TASK_STALLED_SECONDS, AQ_AGENT_TASK_TIMEOUT_SECONDS, DEEPSEEK_BASE_URL
 from src.data import load_dataset
-from src.dataset_storage import dataset_storage_from_env
 from src.i18n import get_language, render_language_selector, t, weather_label
 from src.navigation import render_sidebar_navigation
 from src.ui import dataset_path_from_env, render_dataframe
@@ -52,7 +51,6 @@ CUSTOM_CONFIRMED_KEY = "aq_agent_custom_city_confirmed"
 STABLE_CITY_OPTION_KEY = "aq_agent_stable_city_option"
 STABLE_CITY_APPLIED_KEY = "aq_agent_stable_city_option_applied"
 TASK_STORE_KEY = "aq_agent_task_store"
-TASK_STORE_URL_KEY = "aq_agent_task_store_url"
 CURRENT_TASK_KEY = "aq_agent_current_task_id"
 SYNCED_TASK_RESULT_KEY = "aq_agent_synced_task_result"
 def _safe_secret(key: str) -> str | None:
@@ -116,25 +114,16 @@ def _agent_task_executor():
     return agent_task_executor.agent_task_executor_from_config(_agent_task_executor_mode())
 
 
-def _task_database_url() -> str | None:
-    return _safe_secret("database_url") or _safe_secret("DATABASE_URL")
-
-
 def _task_store_backend_label() -> str:
-    store = task_store_from_config(_task_database_url())
-    if isinstance(store, PostgresAgentTaskStore):
-        return t("agent.task_store_postgres", language)
     return t("agent.task_store_memory", language)
 
 
 def _task_store():
-    database_url = _task_database_url() or ""
     store = st.session_state.get(TASK_STORE_KEY)
-    if store is not None and st.session_state.get(TASK_STORE_URL_KEY) == database_url:
+    if store is not None:
         return store
-    store = task_store_from_config(database_url)
+    store = task_store_from_config()
     st.session_state[TASK_STORE_KEY] = store
-    st.session_state[TASK_STORE_URL_KEY] = database_url
     return store
 
 
@@ -529,13 +518,9 @@ if last_result:
     if not coverage_df.empty:
         render_dataframe(coverage_df, use_container_width=True, hide_index=True)
 
-    output_uri = str(last_result["output_path"])
-    try:
-        output_path = dataset_storage_from_env().get_file(output_uri)
-    except Exception:  # noqa: BLE001
-        output_path = Path(output_uri)
+    output_path = Path(str(last_result["output_path"]))
     if output_path.exists():
-        preview_df = load_dataset(output_uri)
+        preview_df = load_dataset(output_path)
         preview_pollutant = next(
             (
                 pollutant

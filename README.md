@@ -4,12 +4,12 @@
 
 ## 当前状态
 
-项目当前处于“本地闭环完整、云端部署准备中”的半步上云状态：
+项目当前定位为本地运行的 Streamlit 应用：
 
-- 本地模式已经可用：Streamlit UI、北京基础数据集、本地 Agent 采集、本地数据集切换和测试套件均已闭环。
-- 云端代码骨架已经接入：支持 `worker` 任务执行模式、Postgres 任务表、数据集索引、Supabase Storage 适配器和独立 worker 入口。
-- 真实云环境尚未启用：Supabase 项目、Storage bucket、生产 secrets、Render worker 和 Streamlit Cloud 应用还需要按文档完成配置与 smoke test。
-- 当前建议继续使用本地配置：`agent_task_executor_mode = "thread"`、`dataset_storage_mode = "local"`。准备真正上线时，再切换到 `worker + supabase`。
+- Streamlit UI、北京基础数据集、本地 Agent 采集、本地数据集切换和测试套件均已闭环。
+- Historical Data Agent 在当前 Streamlit 进程内以后台线程执行，采集结果保存到 `data/processed/agent_runs/`。
+- 项目不再保留云端任务队列、外部执行进程、远程数据集存储等上云准备代码。
+- 默认运行方式是本地文件读写和本地内存任务状态，适合教学演示、原型验证和轻量研究分析。
 
 ## 系统定位
 
@@ -207,11 +207,9 @@ Agent 的内部执行过程大致如下：
 
 ### Agent 任务执行器与恢复边界
 
-当前本地推荐的任务执行器模式为 `thread`，可通过 Streamlit secrets 中的 `agent_task_executor_mode = "thread"` 显式设置。该模式会在当前 Streamlit 进程内启动后台线程，适合本地运行和单进程部署。
+当前任务执行器模式为 `thread`，可通过 Streamlit secrets 中的 `agent_task_executor_mode = "thread"` 显式设置。该模式会在当前 Streamlit 进程内启动后台线程，适合本地运行和单进程部署。
 
-云端准备模式为 `worker`：Streamlit UI 只创建 `PENDING` 任务，独立 worker 进程从 Supabase Postgres 原子 claim 任务后执行采集，并把生成的数据集上传到 Supabase Storage。这个模式的代码和配置模板已经在仓库中准备好，但只有完成真实 Supabase、Render 和 Streamlit Cloud 配置后才应启用。
-
-为避免重复采集和重复写入输出文件，系统不会在进程重启后自动重跑已经持久化为 `RUNNING` 的历史任务。页面会继续展示任务状态，并由 watchdog 将长时间无进展的任务标记为 `TIMEOUT`。如果需要稳定的云端长任务执行，后续应接入外部 worker 或队列执行器。
+任务状态保存在当前 Streamlit 会话的内存中；采集完成后的数据集会写入本地 `data/processed/agent_runs/`，并由侧边栏数据集选择器自动发现。若应用进程重启，正在运行的任务不会恢复，但已经写入本地的数据集仍可继续加载分析。
 
 ## 项目结构
 
@@ -280,77 +278,12 @@ deepseek_model = "deepseek-v4-flash"
 deepseek_base_url = "https://api.deepseek.com"
 ```
 
-## 部署
-
-### Docker
+## 本地容器运行
 
 ```bash
 docker build -t beijing-aq-dashboard .
 docker run --rm -p 8501:8501 beijing-aq-dashboard
 ```
-
-### Streamlit Community Cloud
-
-部署时至少需要指定：
-
-- 主入口文件：`app.py`
-- Python 版本：`3.14` 或平台支持的最新兼容版本
-
-如果需要自定义默认数据集或启用 DeepSeek，可在平台 Secrets 中补充：
-
-```toml
-data_path = "data/processed/beijing_aq.parquet"
-deepseek_api_key = "sk-..."
-deepseek_model = "deepseek-v4-flash"
-```
-
-### 准备上云：Streamlit Cloud + Supabase + Worker
-
-准备上云时，推荐的最小闭环是：Streamlit Cloud 运行 UI，Supabase Postgres 托管任务状态、任务日志和数据集索引，Supabase Storage 保存生成的数据集文件，独立 worker 进程执行 Historical Data Agent 的采集任务。
-
-当前仓库已经包含这条路径所需的主要代码与配置模板：
-
-- `src.worker`：独立 worker 入口。
-- `docs/supabase_agent_tasks.sql`：Supabase Postgres 表结构。
-- `render.yaml`：Render Background Worker Blueprint。
-- `scripts/supabase_smoke_test.py`：真实 Supabase 连通性与存储 smoke test。
-- `.streamlit/secrets.toml.example`：本地模式和生产模式 secrets 示例。
-
-在真正切换到云端前，需要先完成：
-
-1. 创建 Supabase 项目并执行 `docs/supabase_agent_tasks.sql`。
-2. 创建 `aq-datasets` Storage bucket。
-3. 在 Streamlit Cloud 中配置生产 secrets。
-4. 在 Render 或等价平台部署 worker。
-5. 执行 `scripts/supabase_smoke_test.py`。
-6. 提交一个小范围 Agent 任务，确认 `PENDING -> RUNNING -> SAVED` 全流程通过。
-
-在 Streamlit Cloud secrets 中配置：
-
-```toml
-database_url = "postgresql://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:6543/postgres"
-agent_task_executor_mode = "worker"
-dataset_storage_mode = "supabase"
-supabase_url = "https://<project-ref>.supabase.co"
-supabase_service_role_key = "<service-role-key>"
-supabase_storage_bucket = "aq-datasets"
-deepseek_api_key = "sk-..."
-deepseek_model = "deepseek-v4-flash"
-```
-
-在 Supabase SQL Editor 中执行 `docs/supabase_agent_tasks.sql`，创建 `agent_tasks`、`agent_task_logs` 和 `dataset_index`。`dataset_index` 只保存数据集元数据和文件位置，不保存空气质量明细行。
-
-在 Supabase Storage 中创建 `aq-datasets` bucket。worker 采集完成后会把生成的 parquet/csv 上传到该 bucket，并在 `dataset_index.storage_uri` 中记录 `supabase://aq-datasets/...`。Streamlit UI 选择远程数据集时会先下载到 `.cache/datasets/`，再复用现有数据加载和分析流程。
-
-worker 可部署在 Render、Railway、Fly.io 或 VPS：
-
-```bash
-DATABASE_URL="postgresql://..." DATASET_STORAGE_MODE="supabase" SUPABASE_URL="https://<project-ref>.supabase.co" SUPABASE_SERVICE_ROLE_KEY="<service-role-key>" SUPABASE_STORAGE_BUCKET="aq-datasets" DEEPSEEK_API_KEY="sk-..." python -m src.worker
-```
-
-`thread` 模式仍适合本地和单进程部署；`worker` 模式只提交 PENDING 任务，由独立 worker 原子 claim 后执行。为避免重复采集，历史 `RUNNING` 任务不会在进程重启后自动重跑，仍由 watchdog 标记为 `TIMEOUT`。
-
-上线前请按 `docs/cloud_deployment.md` 和 `docs/production_go_live.md` 执行 Supabase smoke test 与端到端检查。在这些检查完成前，项目应视为“准备上云”，而不是“已经生产上线”。
 
 ## 配置与运行特性
 
@@ -401,8 +334,8 @@ DATABASE_URL="postgresql://..." DATASET_STORAGE_MODE="supabase" SUPABASE_URL="ht
 
 运行全部测试：
 
-```bash
-pytest -q
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
 当前测试覆盖主要包括：
@@ -412,3 +345,5 @@ pytest -q
 - 历史采集逻辑
 - 国际化与目录显示
 - 页面级基础渲染
+
+完整测试分组和手动验收项见 `docs/testing_checklist.md`。

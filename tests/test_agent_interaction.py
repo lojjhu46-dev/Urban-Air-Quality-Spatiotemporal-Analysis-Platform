@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 import time
@@ -261,7 +261,7 @@ def test_agent_page_submits_draft_plan_through_executor(monkeypatch) -> None:
         del args, kwargs
         raise AssertionError("page should submit through agent task executor")
 
-    monkeypatch.setattr(agent_task_store, "task_store_from_config", lambda database_url: store)
+    monkeypatch.setattr(agent_task_store, "task_store_from_config", lambda: store)
     monkeypatch.setattr(agent_task_runner, "start_background_custom_city_task", fail_start_background)
     monkeypatch.setattr(
         agent_task_executor,
@@ -445,7 +445,7 @@ def test_custom_city_plan_writes_task_status_chain(monkeypatch) -> None:
             risk_flags=[],
         )
 
-    monkeypatch.setattr(agent_task_store, "task_store_from_config", lambda database_url: store)
+    monkeypatch.setattr(agent_task_store, "task_store_from_config", lambda: store)
     monkeypatch.setattr(collection_agent, "validate_custom_city_with_deepseek", fake_validate)
     monkeypatch.setattr(collection_agent, "search_city_candidates", fake_search)
     monkeypatch.setattr(collection_agent, "build_collection_plan", fake_build_plan)
@@ -555,7 +555,7 @@ def test_custom_city_collection_writes_saved_task_status(monkeypatch) -> None:
             summary_mode="deterministic",
         )
 
-    monkeypatch.setattr(agent_task_store, "task_store_from_config", lambda database_url: store)
+    monkeypatch.setattr(agent_task_store, "task_store_from_config", lambda: store)
     monkeypatch.setattr(collection_agent, "validate_custom_city_with_deepseek", fake_validate)
     monkeypatch.setattr(collection_agent, "search_city_candidates", fake_search)
     monkeypatch.setattr(collection_agent, "run_collection_agent", fake_run_collection)
@@ -673,7 +673,7 @@ def test_custom_city_collection_accepts_chinese_valid_deepseek_status(monkeypatc
             summary_mode="deterministic",
         )
 
-    monkeypatch.setattr(agent_task_store, "task_store_from_config", lambda database_url: store)
+    monkeypatch.setattr(agent_task_store, "task_store_from_config", lambda: store)
     monkeypatch.setattr(collection_agent, "_deepseek_json_completion", fake_json_completion)
     monkeypatch.setattr(collection_agent, "search_city_candidates", fake_search)
     monkeypatch.setattr(collection_agent, "run_collection_agent", fake_run_collection)
@@ -767,7 +767,7 @@ def test_custom_city_collection_continues_when_deepseek_success_lacks_country_co
             summary_mode="deterministic",
         )
 
-    monkeypatch.setattr(agent_task_store, "task_store_from_config", lambda database_url: store)
+    monkeypatch.setattr(agent_task_store, "task_store_from_config", lambda: store)
     monkeypatch.setattr(collection_agent, "_deepseek_json_completion", fake_json_completion)
     monkeypatch.setattr(collection_agent, "search_city_candidates", fake_search)
     monkeypatch.setattr(collection_agent, "run_collection_agent", fake_run_collection)
@@ -793,7 +793,7 @@ def test_custom_city_validation_failure_shows_task_status_panel(monkeypatch) -> 
         del country_or_region, city_name, kwargs
         raise RuntimeError("DeepSeek timeout")
 
-    monkeypatch.setattr(agent_task_store, "task_store_from_config", lambda database_url: store)
+    monkeypatch.setattr(agent_task_store, "task_store_from_config", lambda: store)
     monkeypatch.setattr(collection_agent, "validate_custom_city_with_deepseek", fake_validate)
 
     at = AppTest.from_file("pages/4_Historical_Data_Agent.py")
@@ -843,7 +843,7 @@ def test_custom_city_keeps_progress_when_candidate_resolution_fails(monkeypatch)
         del args, kwargs
         return []
 
-    monkeypatch.setattr(agent_task_store, "task_store_from_config", lambda database_url: store)
+    monkeypatch.setattr(agent_task_store, "task_store_from_config", lambda: store)
     monkeypatch.setattr(collection_agent, "validate_custom_city_with_deepseek", fake_validate)
     monkeypatch.setattr(collection_agent, "search_city_candidates", fake_search)
 
@@ -1004,7 +1004,7 @@ def test_custom_city_confirmation_yes_submits_through_executor(monkeypatch) -> N
         del args, kwargs
         raise AssertionError("confirmation should submit through agent task executor")
 
-    monkeypatch.setattr(agent_task_store, "task_store_from_config", lambda database_url: store)
+    monkeypatch.setattr(agent_task_store, "task_store_from_config", lambda: store)
     monkeypatch.setattr(agent_task_runner, "start_background_custom_city_task", fail_start_background)
     monkeypatch.setattr(
         agent_task_executor,
@@ -1029,3 +1029,4 @@ def test_custom_city_confirmation_yes_submits_through_executor(monkeypatch) -> N
     assert submissions[0][1] == resumed_task.task_id
     assert submissions[0][2].api_key == "sk-test"
     assert resumed_task.status == AgentTaskStatus.PLANNED
+

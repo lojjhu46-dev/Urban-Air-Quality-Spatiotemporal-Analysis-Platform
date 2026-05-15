@@ -5,7 +5,6 @@ from threading import Event
 import src.agent_task_runner as agent_task_runner
 from src.agent_task_executor import (
     InProcessAgentTaskExecutor,
-    NoOpAgentTaskExecutor,
     agent_task_executor_from_config,
     describe_executor_capabilities,
 )
@@ -34,45 +33,12 @@ def test_agent_task_executor_factory_defaults_to_in_process() -> None:
     assert isinstance(agent_task_executor_from_config("unknown-mode"), InProcessAgentTaskExecutor)
 
 
-def test_agent_task_executor_factory_returns_noop_for_worker_mode() -> None:
-    assert isinstance(agent_task_executor_from_config("worker"), NoOpAgentTaskExecutor)
-
-
 def test_thread_executor_capabilities_do_not_claim_recovery() -> None:
     capabilities = describe_executor_capabilities("unknown-mode")
 
     assert capabilities.mode == "thread"
-    assert not capabilities.supports_external_worker
-    assert not capabilities.supports_cross_process_recovery
     assert not capabilities.auto_reruns_running_tasks
     assert "not automatically rerun" in capabilities.notes
-
-
-def test_worker_executor_capabilities_claim_external_worker_support() -> None:
-    capabilities = describe_executor_capabilities("worker")
-
-    assert capabilities.mode == "worker"
-    assert capabilities.supports_external_worker
-    assert capabilities.supports_cross_process_recovery
-    assert not capabilities.auto_reruns_running_tasks
-    assert "worker process" in capabilities.notes
-
-
-def test_worker_executor_queues_without_starting_local_thread() -> None:
-    store = InMemoryAgentTaskStore()
-    task = store.create_task(kind="custom_city_collection", request_payload=_custom_payload())
-
-    submission = NoOpAgentTaskExecutor().submit_custom_city_task(
-        store,
-        task.task_id,
-        AgentTaskRunConfig(api_key="sk-test"),
-    )
-
-    assert submission.task_id == task.task_id
-    assert submission.mode == "worker"
-    assert submission.started is False
-    assert "queued" in submission.message.lower()
-    assert store.get_task(task.task_id).status == AgentTaskStatus.PENDING
 
 
 def test_in_process_executor_submits_background_task(monkeypatch) -> None:

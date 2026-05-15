@@ -46,37 +46,6 @@ def test_terminal_task_result_syncs_once() -> None:
     assert st.session_state[PENDING_DATASET_CHOICE_KEY] == "data/processed/agent_runs/tokyo_2024_2026_aq.parquet"
 
 
-def test_terminal_remote_task_result_syncs_storage_uri() -> None:
-    _clear_session_state()
-    store = InMemoryAgentTaskStore()
-    task = store.create_task(kind="custom_city_collection", request_payload={"city_query": "Tokyo"})
-    saved = store.update_task(
-        task.task_id,
-        status=AgentTaskStatus.SAVED,
-        phase="SAVED",
-        progress=1.0,
-        message="Saved Tokyo dataset.",
-        result_payload={
-            "plan": {"city_label": "Tokyo, Japan"},
-            "output_path": "supabase://aq-data/tokyo.parquet",
-            "row_count": 1,
-            "summary_text": "Saved Tokyo dataset.",
-            "summary_mode": "deterministic",
-            "runtime_warnings": [],
-            "coverage_rows": [],
-            "started_at": "2024-01-01 00:00:00",
-            "ended_at": "2024-01-01 00:00:00",
-        },
-        output_path="supabase://aq-data/tokyo.parquet",
-    )
-
-    assert sync_task_result_to_session(saved, synced_task_result_key="synced_task") is True
-
-    assert st.session_state[DATASET_OVERRIDE_KEY] == "supabase://aq-data/tokyo.parquet"
-    assert st.session_state[PENDING_DATASET_CHOICE_KEY] == "supabase://aq-data/tokyo.parquet"
-    assert st.session_state["aq_agent_last_result"]["output_path"] == "supabase://aq-data/tokyo.parquet"
-
-
 def test_confirmation_visibility_requires_matching_inputs() -> None:
     validation = CustomCityValidationResult(
         input_country="Japen",

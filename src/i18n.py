@@ -90,7 +90,6 @@ TRANSLATIONS = {
     "agent.model": {"zh-CN": "\u6a21\u578b", "en": "Model"},
     "agent.base_url": {"zh-CN": "Base URL", "en": "Base URL"},
     "agent.task_store_backend": {"zh-CN": "\u4efb\u52a1\u72b6\u6001\u5b58\u50a8\uff1a{backend}", "en": "Task status storage: {backend}"},
-    "agent.task_store_postgres": {"zh-CN": "Supabase Postgres", "en": "Supabase Postgres"},
     "agent.task_store_memory": {"zh-CN": "\u672c\u5730\u5185\u5b58\uff08\u672a\u6301\u4e45\u5316\uff09", "en": "Local memory (not persistent)"},
     "agent.task_status_section": {"zh-CN": "\u5f53\u524d Agent \u4efb\u52a1", "en": "Current Agent Task"},
     "agent.task_status_caption": {"zh-CN": "\u4efb\u52a1 ID\uff1a{task_id} | \u66f4\u65b0\u65f6\u95f4\uff1a{updated_at}", "en": "Task ID: {task_id} | Updated: {updated_at}"},

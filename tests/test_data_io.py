@@ -60,29 +60,3 @@ def test_load_dataset_reads_csv_and_normalizes_timestamp(monkeypatch) -> None:
     finally:
         shutil.rmtree(tmp_path, ignore_errors=True)
 
-
-def test_load_dataset_resolves_remote_storage_uri(monkeypatch) -> None:
-    tmp_path = _workspace_temp_dir()
-    try:
-        cached = tmp_path / "remote.csv"
-        pd.DataFrame(
-            {
-                "timestamp": ["2024-01-01T00:00:00+08:00"],
-                "station_id": ["A"],
-                "pm25": [12.0],
-            }
-        ).to_csv(cached, index=False)
-
-        class FakeStorage:
-            def get_file(self, storage_uri: str) -> Path:
-                assert storage_uri == "supabase://aq-data/remote.csv"
-                return cached
-
-        monkeypatch.setattr(data, "dataset_storage_from_env", lambda: FakeStorage())
-
-        loaded = data.load_dataset("supabase://aq-data/remote.csv")
-
-        assert len(loaded) == 1
-        assert float(loaded["pm25"].iloc[0]) == 12.0
-    finally:
-        shutil.rmtree(tmp_path, ignore_errors=True)

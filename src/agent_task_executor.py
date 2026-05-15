@@ -17,8 +17,6 @@ class AgentTaskSubmission:
 @dataclass(frozen=True, slots=True)
 class AgentTaskExecutorCapabilities:
     mode: str
-    supports_external_worker: bool
-    supports_cross_process_recovery: bool
     auto_reruns_running_tasks: bool
     notes: str
 
@@ -50,54 +48,15 @@ class InProcessAgentTaskExecutor:
         )
 
 
-class NoOpAgentTaskExecutor:
-    mode = "worker"
-
-    def submit_custom_city_task(
-        self,
-        store: AgentTaskStore,
-        task_id: str,
-        config: AgentTaskRunConfig,
-    ) -> AgentTaskSubmission:
-        del config
-        task = store.get_task(task_id)
-        if task is None:
-            raise KeyError(task_id)
-        return AgentTaskSubmission(
-            task_id=task_id,
-            mode=self.mode,
-            started=False,
-            message="Task queued. A worker process will claim and execute it.",
-        )
-
-
 def agent_task_executor_from_config(mode: str | None = None) -> AgentTaskExecutor:
-    normalized = (mode or "thread").strip().casefold()
-    if normalized in {"", "thread", "inprocess", "in-process", "local"}:
-        return InProcessAgentTaskExecutor()
-    if normalized in {"worker", "postgres-worker", "postgres_queue", "postgres-queue"}:
-        return NoOpAgentTaskExecutor()
+    del mode
     return InProcessAgentTaskExecutor()
 
 
 def describe_executor_capabilities(mode: str | None = None) -> AgentTaskExecutorCapabilities:
     executor = agent_task_executor_from_config(mode)
-    if getattr(executor, "mode", "thread") == "worker":
-        return AgentTaskExecutorCapabilities(
-            mode="worker",
-            supports_external_worker=True,
-            supports_cross_process_recovery=True,
-            auto_reruns_running_tasks=False,
-            notes=(
-                "Worker mode queues tasks in the shared task store. "
-                "A separate worker process claims PENDING tasks and executes them. "
-                "Persisted RUNNING tasks are not automatically rerun; the watchdog should mark stale tasks as TIMEOUT."
-            ),
-        )
     return AgentTaskExecutorCapabilities(
         mode=getattr(executor, "mode", "thread"),
-        supports_external_worker=False,
-        supports_cross_process_recovery=False,
         auto_reruns_running_tasks=False,
         notes=(
             "The thread executor runs work inside the current Streamlit process. "

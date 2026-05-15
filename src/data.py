@@ -10,7 +10,6 @@ from typing import Iterable
 import pandas as pd
 
 from src.config import DEFAULT_DATA_PATH, TIMEZONE
-from src.dataset_storage import dataset_storage_from_env, is_remote_storage_uri
 
 TABULAR_SUFFIXES = (".parquet", ".csv")
 
@@ -46,9 +45,6 @@ def output_dataset_path(path: str | Path) -> Path:
 
 
 def resolve_existing_dataset_path(path: str | Path) -> Path:
-    if is_remote_storage_uri(path):
-        return dataset_storage_from_env().get_file(str(path))
-
     dataset_path = Path(path)
     suffix = dataset_path.suffix.lower()
 
@@ -141,7 +137,7 @@ def _read_dataset_frame(dataset_path: Path) -> pd.DataFrame:
 
 def load_dataset(path: str | Path | None = None) -> pd.DataFrame:
     """Load processed dataset with lightweight dtypes for faster interaction."""
-    requested_path = str(path) if path is not None and is_remote_storage_uri(path) else Path(path) if path else DEFAULT_DATA_PATH
+    requested_path = Path(path) if path else DEFAULT_DATA_PATH
     dataset_path = resolve_existing_dataset_path(requested_path)
 
     if not dataset_path.exists() or _should_bootstrap_default_csv(requested_path, dataset_path):
